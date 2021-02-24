@@ -27,13 +27,11 @@
 #include "gpio.h"
 #include "timing.h"
 #include "timing_stm32.h"
-#include "version.h"
 
 #include <setjmp.h>
 
 #define PLATFORM_HAS_TRACESWO
-#define BOARD_IDENT "Black Magic Probe (F4Discovery), (Firmware " FIRMWARE_VERSION ")"
-#define DFU_IDENT   "Black Magic Firmware Upgrade (F4Discovery)"
+#define PLATFORM_IDENT "(F4Discovery) "
 
 /* Important pin mappings for STM32 implementation:
  *
@@ -135,8 +133,6 @@
 #define TRACE_IRQ   NVIC_TIM3_IRQ
 #define TRACE_ISR   tim3_isr
 
-#define DEBUG(...)
-
 #define gpio_set_val(port, pin, val) do {	\
 	if(val)					\
 		gpio_set((port), (pin));	\
@@ -153,11 +149,37 @@ static inline int platform_hwversion(void)
 	return 0;
 }
 
-/* Use newlib provided integer only stdio functions */
-#define sscanf siscanf
-#define sprintf siprintf
-#define vasprintf vasiprintf
-#define snprintf sniprintf
+/*
+ * Use newlib provided integer only stdio functions
+ */
 
+/* sscanf */
+#ifdef sscanf
+#undef sscanf
+#define sscanf siscanf
+#else
+#define sscanf siscanf
+#endif
+/* sprintf */
+#ifdef sprintf
+#undef sprintf
+#define sprintf siprintf
+#else
+#define sprintf siprintf
+#endif
+/* vasprintf */
+#ifdef vasprintf
+#undef vasprintf
+#define vasprintf vasiprintf
+#else
+#define vasprintf vasiprintf
+#endif
+/* snprintf */
+#ifdef snprintf
+#undef snprintf
+#define snprintf sniprintf
+#else
+#define snprintf sniprintf
 #endif
 
+#endif

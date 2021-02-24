@@ -27,22 +27,19 @@
 #include "gpio.h"
 #include "timing.h"
 #include "timing_stm32.h"
-#include "version.h"
 
 #include <libopencm3/cm3/common.h>
-#include <libopencm3/stm32/f1/memorymap.h>
+#include <libopencm3/stm32/memorymap.h>
 #include <libopencm3/usb/usbd.h>
 
 #ifdef ENABLE_DEBUG
 # define PLATFORM_HAS_DEBUG
 # define USBUART_DEBUG
+extern bool debug_bmp;
+int usbuart_debug_write(const char *buf, size_t len);
 #endif
 
-#define BOARD_IDENT       "Black Magic Probe (STLINK), (Firmware " FIRMWARE_VERSION ")"
-#define BOARD_IDENT_DFU   "Black Magic (Upgrade) for STLink/Discovery, (Firmware " FIRMWARE_VERSION ")"
-#define BOARD_IDENT_UPD   "Black Magic (DFU Upgrade) for STLink/Discovery, (Firmware " FIRMWARE_VERSION ")"
-#define DFU_IDENT         "Black Magic Firmware Upgrade (STLINK)"
-#define UPD_IFACE_STRING  "@Internal Flash   /0x08000000/8*001Kg"
+#define PLATFORM_IDENT   "(STLINK/V2) "
 
 /* Hardware definitions... */
 #define TDI_PORT	GPIOA
@@ -70,12 +67,13 @@
 
 #define PLATFORM_HAS_TRACESWO	1
 #define NUM_TRACE_PACKETS		(128)		/* This is an 8K buffer */
+#define TRACESWO_PROTOCOL		2			/* 1 = Manchester, 2 = NRZ / async */
 
 # define SWD_CR   GPIO_CRH(SWDIO_PORT)
 # define SWD_CR_MULT (1 << ((14 - 8) << 2))
 
 #define TMS_SET_MODE() \
-	gpio_set_mode(TMS_PORT, GPIO_MODE_OUTPUT_50_MHZ, \
+	gpio_set_mode(TMS_PORT, GPIO_MODE_OUTPUT_2_MHZ, \
 	              GPIO_CNF_OUTPUT_PUSHPULL, TMS_PIN);
 #define SWDIO_MODE_FLOAT() 	do { \
 	uint32_t cr = SWD_CR; \
@@ -117,14 +115,6 @@
 #define USBUSART_TIM_IRQ NVIC_TIM4_IRQ
 #define USBUSART_TIM_ISR tim4_isr
 
-#ifdef ENABLE_DEBUG
-extern bool debug_bmp;
-int usbuart_debug_write(const char *buf, size_t len);
-# define DEBUG printf
-#else
-# define DEBUG(...)
-#endif
-
 /* On F103, only USART1 is on AHB2 and can reach 4.5 MBaud at 72 MHz.*/
 #define SWO_UART				USART1
 #define SWO_UART_DR				USART1_DR
@@ -147,11 +137,39 @@ extern uint16_t led_idle_run;
 
 extern uint32_t detect_rev(void);
 
-/* Use newlib provided integer only stdio functions */
+/*
+ * Use newlib provided integer only stdio functions
+ */
+
+/* sscanf */
+#ifdef sscanf
+#undef sscanf
 #define sscanf siscanf
+#else
+#define sscanf siscanf
+#endif
+/* sprintf */
+#ifdef sprintf
+#undef sprintf
 #define sprintf siprintf
+#else
+#define sprintf siprintf
+#endif
+/* vasprintf */
+#ifdef vasprintf
+#undef vasprintf
 #define vasprintf vasiprintf
+#else
+#define vasprintf vasiprintf
+#endif
+/* snprintf */
+#ifdef snprintf
+#undef snprintf
 #define snprintf sniprintf
+#else
+#define snprintf sniprintf
+#endif
+
 
 #endif
 

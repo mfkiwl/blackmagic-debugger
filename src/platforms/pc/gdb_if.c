@@ -24,6 +24,7 @@
  */
 
 #if defined(_WIN32) || defined(__CYGWIN__)
+#   define __USE_MINGW_ANSI_STDIO 1
 #   include <winsock2.h>
 #   include <windows.h>
 #   include <ws2tcpip.h>
@@ -88,7 +89,7 @@ int gdb_if_init(void)
 		}
 		break;
 	} while(1);
-	DEBUG("Listening on TCP: %4d\n", port);
+	DEBUG_WARN("Listening on TCP: %4d\n", port);
 
 	return 0;
 }
@@ -98,29 +99,43 @@ unsigned char gdb_if_getchar(void)
 {
 	unsigned char ret;
 	int i = 0;
-
+#if defined(_WIN32) || defined(__CYGWIN__)
+	unsigned long opt;
+#else
+	int flags;
+#endif
 	while(i <= 0) {
 		if(gdb_if_conn <= 0) {
 #if defined(_WIN32) || defined(__CYGWIN__)
-			unsigned long opt = 1;
+			opt = 1;
 			ioctlsocket(gdb_if_serv, FIONBIO, &opt);
 #else
-			int flags = fcntl(gdb_if_serv, F_GETFL);
+			flags = fcntl(gdb_if_serv, F_GETFL);
 			fcntl(gdb_if_serv, F_SETFL, flags | O_NONBLOCK);
 #endif
 			while(1) {
 				gdb_if_conn = accept(gdb_if_serv, NULL, NULL);
 				if (gdb_if_conn == -1) {
+#if defined(_WIN32) || defined(__CYGWIN__)
+					if (WSAGetLastError() == WSAEWOULDBLOCK) {
+#else
 					if (errno == EWOULDBLOCK) {
+#endif
 						SET_IDLE_STATE(1);
 						platform_delay(100);
 					} else {
-						DEBUG("error when accepting connection");
+#if defined(_WIN32) || defined(__CYGWIN__)
+						DEBUG_WARN("error when accepting connection: %d",
+								   WSAGetLastError());
+#else
+						DEBUG_WARN("error when accepting connection: %s",
+								   strerror(errno));
+#endif
 						exit(1);
 					}
 				} else {
 #if defined(_WIN32) || defined(__CYGWIN__)
-					unsigned long opt = 0;
+					opt = 0;
 					ioctlsocket(gdb_if_serv, FIONBIO, &opt);
 #else
 					fcntl(gdb_if_serv, F_SETFL, flags);
@@ -128,12 +143,23 @@ unsigned char gdb_if_getchar(void)
 					break;
 				}
 			}
-			DEBUG("Got connection\n");
+			DEBUG_INFO("Got connection\n");
+#if defined(_WIN32) || defined(__CYGWIN__)
+			opt = 0;
+			ioctlsocket(gdb_if_conn, FIONBIO, &opt);
+#else
+			flags = fcntl(gdb_if_conn, F_GETFL);
+			fcntl(gdb_if_conn, F_SETFL, flags & ~O_NONBLOCK);
+#endif
 		}
 		i = recv(gdb_if_conn, (void*)&ret, 1, 0);
 		if(i <= 0) {
 			gdb_if_conn = -1;
-			DEBUG("Dropped broken connection\n");
+#if defined(_WIN32) || defined(__CYGWIN__)
+			DEBUG_INFO("Dropped broken connection: %d\n", WSAGetLastError());
+#else
+			DEBUG_INFO("Dropped broken connection: %s\n", strerror(errno));
+#endif
 			/* Return '+' in case we were waiting for an ACK */
 			return '+';
 		}

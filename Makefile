@@ -5,11 +5,7 @@ endif
 
 PC_HOSTED =
 NO_LIBOPENCM3 =
-ifeq ($(PROBE_HOST), libftdi)
-	PC_HOSTED = true
-	NO_LIBOPENCM3 = true
-endif
-ifeq ($(PROBE_HOST), pc-stlinkv2)
+ifeq ($(PROBE_HOST), hosted)
 	PC_HOSTED = true
 	NO_LIBOPENCM3 = true
 endif

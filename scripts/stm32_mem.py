@@ -2,7 +2,7 @@
 #
 # stm32_mem.py: STM32 memory access using USB DFU class
 # Copyright (C) 2011  Black Sphere Technologies
-# Copyright (C) 2017  Uwe Bonnes (bon@elektron.ikp.physik.tu-darmstadt.de)
+# Copyright (C) 2017, 2020  Uwe Bonnes (bon@elektron.ikp.physik.tu-darmstadt.de)
 # Written by Gareth McMullin <gareth@blacksphere.co.nz>
 #
 # This program is free software: you can redistribute it and/or modify
@@ -18,17 +18,19 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+from __future__ import print_function
 from time import sleep
 import struct
+import os
 from sys import stdout, argv
 
 import argparse
 import usb
 import dfu
 
-CMD_GETCOMMANDS =            0x00
-CMD_SETADDRESSPOINTER =      0x21
-CMD_ERASE =                  0x41
+CMD_GETCOMMANDS =       0x00
+CMD_SETADDRESSPOINTER = 0x21
+CMD_ERASE =             0x41
 
 def stm32_erase(dev, addr):
 	erase_cmd = struct.pack("<BL", CMD_ERASE, addr)
@@ -119,9 +121,9 @@ def stm32_scan(args, test):
 		print("Found multiple devices:\n")
 		for dev in bmp_devs:
 			dfudev = dfu.dfu_device(*dev)
-			man = dfudev.handle.getString(dfudev.dev.iManufacturer, 30)
-			product = dfudev.handle.getString(dfudev.dev.iProduct, 96)
-			serial_no = dfudev.handle.getString(dfudev.dev.iSerialNumber, 30)
+			man = dfudev.handle.getString(dfudev.dev.iManufacturer, 30).decode('utf8')
+			product = dfudev.handle.getString(dfudev.dev.iProduct, 96).decode('utf8')
+			serial_no = dfudev.handle.getString(dfudev.dev.iSerialNumber, 30).decode('utf8')
 			print("Device ID:\t %04x:%04x" % (dfudev.dev.idVendor, dfudev.dev.idProduct))
 			print("Manufacturer:\t %s" % man)
 			print("Product:\t %s" % product)
@@ -132,9 +134,9 @@ def stm32_scan(args, test):
 
 	for dev in bmp_devs:
 		dfudev = dfu.dfu_device(*dev)
-		man = dfudev.handle.getString(dfudev.dev.iManufacturer, 30)
-		product = dfudev.handle.getString(dfudev.dev.iProduct, 96)
-		serial_no = dfudev.handle.getString(dfudev.dev.iSerialNumber, 30)
+		man = dfudev.handle.getString(dfudev.dev.iManufacturer, 30).decode('utf8')
+		product = dfudev.handle.getString(dfudev.dev.iProduct, 96).decode('utf8')
+		serial_no = dfudev.handle.getString(dfudev.dev.iSerialNumber, 30).decode('utf8')
 		if args.serial_target:
 			if man == "Black Sphere Technologies" and serial_no ==	args.serial_target:
 				break
@@ -148,7 +150,7 @@ def stm32_scan(args, test):
 	print("Serial:\t\t %s" % serial_no)
 
 	if args.serial_target and serial_no != args.serial_target:
-		print("Serial number doesn't match!\n")
+		print("Serial number doesn't match %s vs %s!\n" % (serial_no, args.serial_target))
 		exit(-2)
 
 	return dfudev
@@ -195,19 +197,23 @@ if __name__ == "__main__":
 		exit(0)
 	dfudev.make_idle()
 	file = open(args.progfile, "rb")
+	if (os.path.getsize(args.progfile) > 0x1f800):
+		print("File too large")
+		exit(0)
+
 	bin = file.read()
 
-	product = dfudev.handle.getString(dfudev.dev.iProduct, 64)
+	product = dfudev.handle.getString(dfudev.dev.iProduct, 64).decode('utf8')
 	if args.address :
 		start = int(args.address, 0)
 	else :
-		if b"F4" in product:
+		if "F4" in product or "STLINK-V3" in product:
 			start = 0x8004000
 		else:
 			start = 0x8002000
 	addr = start
 	while bin:
-		print ("Programming memory at 0x%08X\r" % addr),
+		print ("Programming memory at 0x%08X" % addr, end="\r")
 		stdout.flush()
 		try:
 # STM DFU bootloader erases always.
@@ -238,7 +244,7 @@ if __name__ == "__main__":
 		except:
 # Abort silent if bootloader does not support upload
 			break
-		print ("Verifying memory at   0x%08X\r" % addr),
+		print ("Verifying memory at 0x%08X" % addr, end="\r")
 		stdout.flush()
 		if len > 1024 :
 			size = 1024

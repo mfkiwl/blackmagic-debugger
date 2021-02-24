@@ -25,7 +25,6 @@
 #include "lpc_common.h"
 
 #define LPC43XX_CHIPID	0x40043200
-#define ARM_CPUID	0xE000ED00
 
 #define IAP_ENTRYPOINT_LOCATION	0x10400100
 
@@ -80,19 +79,18 @@ void lpc43xx_add_flash(target *t, uint32_t iap_entry,
 
 bool lpc43xx_probe(target *t)
 {
-	uint32_t chipid, cpuid;
+	uint32_t chipid;
 	uint32_t iap_entry;
 
 	chipid = target_mem_read32(t, LPC43XX_CHIPID);
-	cpuid = target_mem_read32(t, ARM_CPUID);
 
 	switch(chipid) {
 	case 0x4906002B:	/* Parts with on-chip flash */
 	case 0x7906002B:	/* LM43S?? - Undocumented? */
-		switch (cpuid & 0xFF00FFF0) {
+		switch (t->cpuid & 0xFF00FFF0) {
 		case 0x4100C240:
 			t->driver = "LPC43xx Cortex-M4";
-			if (cpuid == 0x410FC241)
+			if (t->cpuid == 0x410FC241)
 			{
 				/* LPC4337 */
 				iap_entry = target_mem_read32(t,
@@ -121,7 +119,7 @@ bool lpc43xx_probe(target *t)
 		return true;
 	case 0x5906002B:	/* Flashless parts */
 	case 0x6906002B:
-		switch (cpuid & 0xFF00FFF0) {
+		switch (t->cpuid & 0xFF00FFF0) {
 		case 0x4100C240:
 			t->driver = "LPC43xx Cortex-M4";
 			break;
@@ -164,11 +162,11 @@ static bool lpc43xx_cmd_erase(target *t, int argc, const char *argv[])
 	for (int bank = 0; bank < FLASH_NUM_BANK; bank++)
 	{
 		struct lpc_flash *f = (struct lpc_flash *)t->flash;
-		if (lpc_iap_call(f, IAP_CMD_PREPARE,
+		if (lpc_iap_call(f, NULL, IAP_CMD_PREPARE,
 		                 0, FLASH_NUM_SECTOR-1, bank))
 			return false;
 
-		if (lpc_iap_call(f, IAP_CMD_ERASE,
+		if (lpc_iap_call(f, NULL, IAP_CMD_ERASE,
 		                 0, FLASH_NUM_SECTOR-1, CPU_CLK_KHZ, bank))
 			return false;
 	}
@@ -188,7 +186,7 @@ static int lpc43xx_flash_init(target *t)
 
 	/* Initialize flash IAP */
 	struct lpc_flash *f = (struct lpc_flash *)t->flash;
-	if (lpc_iap_call(f, IAP_CMD_INIT))
+	if (lpc_iap_call(f, NULL, IAP_CMD_INIT))
 		return -1;
 
 	return 0;
@@ -234,7 +232,7 @@ static bool lpc43xx_cmd_mkboot(target *t, int argc, const char *argv[])
 
 	/* special command to compute/write magic vector for signature */
 	struct lpc_flash *f = (struct lpc_flash *)t->flash;
-	if (lpc_iap_call(f, IAP_CMD_SET_ACTIVE_BANK, bank, CPU_CLK_KHZ)) {
+	if (lpc_iap_call(f, NULL, IAP_CMD_SET_ACTIVE_BANK, bank, CPU_CLK_KHZ)) {
 		tc_printf(t, "Set bootable failed.\n");
 		return false;
 	}

@@ -27,7 +27,7 @@
 #include "usbuart.h"
 #include "morse.h"
 
-#include <libopencm3/stm32/f4/rcc.h>
+#include <libopencm3/stm32/rcc.h>
 #include <libopencm3/cm3/scb.h>
 #include <libopencm3/cm3/nvic.h>
 #include <libopencm3/stm32/exti.h>
@@ -85,7 +85,7 @@ bool platform_srst_get_val(void) { return false; }
 
 const char *platform_target_voltage(void)
 {
-	return "ABSENT!";
+	return NULL;
 }
 
 void platform_request_boot(void)

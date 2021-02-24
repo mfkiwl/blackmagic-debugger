@@ -30,14 +30,15 @@
 
 #define PLATFORM_HAS_TRACESWO
 #define PLATFORM_HAS_POWER_SWITCH
+
 #ifdef ENABLE_DEBUG
-#define PLATFORM_HAS_DEBUG
-#define USBUART_DEBUG
+# define PLATFORM_HAS_DEBUG
+# define USBUART_DEBUG
+extern bool debug_bmp;
+int usbuart_debug_write(const char *buf, size_t len);
 #endif
-#define BOARD_IDENT             "Black Magic Probe"
-#define BOARD_IDENT_DFU	        "Black Magic Probe (Upgrade)"
-#define BOARD_IDENT_UPD	        "Black Magic Probe (DFU Upgrade)"
-#define DFU_IDENT               "Black Magic Firmware Upgrade"
+
+#define PLATFORM_IDENT          " "
 #define UPD_IFACE_STRING        "@Internal Flash   /0x08000000/8*001Kg"
 
 /* Important pin mappings for STM32 implementation:
@@ -46,7 +47,7 @@
  * LED1 = 	PB10	(Yellow LED : Idle)
  * LED2 = 	PB11	(Red LED    : Error)
  *
- * TPWR = 	RB0 (input) -- analogue on mini design ADC1, ch8
+ * TPWR = 	PB0 (input) -- analogue on mini design ADC1, ch8
  * nTRST = 	PB1 (output) [blackmagic]
  * PWR_BR = 	PB1 (output) [blackmagic_mini] -- supply power to the target, active low
  * TMS_DIR =    PA1 (output) [blackmagic_mini v2.1] -- choose direction of the TCK pin, input low, output high
@@ -165,23 +166,41 @@
 #define TRACE_IRQ   NVIC_TIM3_IRQ
 #define TRACE_ISR   tim3_isr
 
-#ifdef ENABLE_DEBUG
-extern bool debug_bmp;
-int usbuart_debug_write(const char *buf, size_t len);
-
-#define DEBUG printf
-#else
-#define DEBUG(...)
-#endif
-
 #define SET_RUN_STATE(state)	{running_status = (state);}
 #define SET_IDLE_STATE(state)	{gpio_set_val(LED_PORT, LED_IDLE_RUN, state);}
 #define SET_ERROR_STATE(state)	{gpio_set_val(LED_PORT, LED_ERROR, state);}
 
-/* Use newlib provided integer only stdio functions */
+/*
+ * Use newlib provided integer only stdio functions
+ */
+
+/* sscanf */
+#ifdef sscanf
+#undef sscanf
 #define sscanf siscanf
+#else
+#define sscanf siscanf
+#endif
+/* sprintf */
+#ifdef sprintf
+#undef sprintf
 #define sprintf siprintf
-#define snprintf sniprintf
+#else
+#define sprintf siprintf
+#endif
+/* vasprintf */
+#ifdef vasprintf
+#undef vasprintf
 #define vasprintf vasiprintf
+#else
+#define vasprintf vasiprintf
+#endif
+/* snprintf */
+#ifdef snprintf
+#undef snprintf
+#define snprintf sniprintf
+#else
+#define snprintf sniprintf
+#endif
 
 #endif

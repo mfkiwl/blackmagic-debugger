@@ -29,7 +29,8 @@ struct flash_param {
 	uint16_t pad0;
 	uint32_t command;
 	uint32_t words[4];
-	uint32_t result;
+	uint32_t status;
+	uint32_t result[4];
 } __attribute__((aligned(4)));
 
 
@@ -39,7 +40,7 @@ struct lpc_flash *lpc_add_flash(target *t, target_addr addr, size_t length)
 	struct target_flash *f;
 
 	if (!lf) {			/* calloc failed: heap exhaustion */
-		DEBUG("calloc: failed in %s\n", __func__);
+		DEBUG_WARN("calloc: failed in %s\n", __func__);
 		return NULL;
 	}
 
@@ -53,7 +54,7 @@ struct lpc_flash *lpc_add_flash(target *t, target_addr addr, size_t length)
 	return lf;
 }
 
-enum iap_status lpc_iap_call(struct lpc_flash *f, enum iap_cmd cmd, ...)
+enum iap_status lpc_iap_call(struct lpc_flash *f, void *result, enum iap_cmd cmd, ...)
 {
 	target *t = f->f.t;
 	struct flash_param param = {
@@ -64,6 +65,14 @@ enum iap_status lpc_iap_call(struct lpc_flash *f, enum iap_cmd cmd, ...)
 	/* Pet WDT before each IAP call, if it is on */
 	if (f->wdt_kick)
 		f->wdt_kick(t);
+
+	/* save IAP RAM to restore after IAP call */
+	struct flash_param backup_param;
+	target_mem_read(t, &backup_param, f->iap_ram, sizeof(backup_param));
+
+	/* save registers to restore after IAP call */
+	uint32_t backup_regs[t->regs_size / sizeof(uint32_t)];
+	target_regs_read(t, backup_regs);
 
 	/* fill out the remainder of the parameters */
 	va_list ap;
@@ -79,7 +88,7 @@ enum iap_status lpc_iap_call(struct lpc_flash *f, enum iap_cmd cmd, ...)
 	uint32_t regs[t->regs_size / sizeof(uint32_t)];
 	target_regs_read(t, regs);
 	regs[0] = f->iap_ram + offsetof(struct flash_param, command);
-	regs[1] = f->iap_ram + offsetof(struct flash_param, result);
+	regs[1] = f->iap_ram + offsetof(struct flash_param, status);
 	regs[REG_MSP] = f->iap_msp;
 	regs[REG_LR] = f->iap_ram | 1;
 	regs[REG_PC] = f->iap_entry;
@@ -91,7 +100,21 @@ enum iap_status lpc_iap_call(struct lpc_flash *f, enum iap_cmd cmd, ...)
 
 	/* copy back just the parameters structure */
 	target_mem_read(t, &param, f->iap_ram, sizeof(param));
-	return param.result;
+
+	/* restore the original data in RAM and registers */
+	target_mem_write(t, f->iap_ram, &backup_param, sizeof(param));
+	target_regs_write(t, backup_regs);
+
+	/* if the user expected a result, set the result (16 bytes). */
+	if (result != NULL)
+		memcpy(result, param.result, sizeof(param.result));
+
+	if (param.status != IAP_STATUS_CMD_SUCCESS) {
+		DEBUG_WARN("IAP failure code %d for cmd %d\n",
+			   (enum iap_status)param.status, cmd);
+	}
+
+	return param.status;
 }
 
 static uint8_t lpc_sector_for_addr(struct lpc_flash *f, uint32_t addr)
@@ -105,15 +128,15 @@ int lpc_flash_erase(struct target_flash *tf, target_addr addr, size_t len)
 	uint32_t start = lpc_sector_for_addr(f, addr);
 	uint32_t end = lpc_sector_for_addr(f, addr + len - 1);
 
-	if (lpc_iap_call(f, IAP_CMD_PREPARE, start, end, f->bank))
+	if (lpc_iap_call(f, NULL, IAP_CMD_PREPARE, start, end, f->bank))
 		return -1;
 
 	/* and now erase them */
-	if (lpc_iap_call(f, IAP_CMD_ERASE, start, end, CPU_CLK_KHZ, f->bank))
+	if (lpc_iap_call(f, NULL, IAP_CMD_ERASE, start, end, CPU_CLK_KHZ, f->bank))
 		return -2;
 
 	/* check erase ok */
-	if (lpc_iap_call(f, IAP_CMD_BLANKCHECK, start, end, f->bank))
+	if (lpc_iap_call(f, NULL, IAP_CMD_BLANKCHECK, start, end, f->bank))
 		return -3;
 
 	return 0;
@@ -125,7 +148,7 @@ int lpc_flash_write(struct target_flash *tf,
 	struct lpc_flash *f = (struct lpc_flash *)tf;
 	/* prepare... */
 	uint32_t sector = lpc_sector_for_addr(f, dest);
-	if (lpc_iap_call(f, IAP_CMD_PREPARE, sector, sector, f->bank))
+	if (lpc_iap_call(f, NULL, IAP_CMD_PREPARE, sector, sector, f->bank))
 		return -1;
 
 	/* Write payload to target ram */
@@ -133,7 +156,7 @@ int lpc_flash_write(struct target_flash *tf,
 	target_mem_write(f->f.t, bufaddr, src, len);
 
 	/* set the destination address and program */
-	if (lpc_iap_call(f, IAP_CMD_PROGRAM, dest, bufaddr, len, CPU_CLK_KHZ))
+	if (lpc_iap_call(f, NULL, IAP_CMD_PROGRAM, dest, bufaddr, len, CPU_CLK_KHZ))
 		return -2;
 
 	return 0;
@@ -147,8 +170,10 @@ int lpc_flash_write_magic_vect(struct target_flash *f,
 		uint32_t *w = (uint32_t *)src;
 		uint32_t sum = 0;
 
+		/* compute checksum of first 7 vectors */
 		for (unsigned i = 0; i < 7; i++)
 			sum += w[i];
+		/* two's complement is written to 8'th vector */
 		w[7] = ~sum + 1;
 	}
 	return lpc_flash_write(f, dest, src, len);

@@ -216,7 +216,10 @@ void USBUSART_ISR(void)
 {
 	uint32_t err = USART_SR(USBUSART);
 	char c = usart_recv(USBUSART);
-	if (err & (USART_SR_ORE | USART_SR_FE | USART_SR_NE))
+#if !defined(USART_SR_NE) && defined(USART_ISR_NF)
+# define USART_SR_NE USART_ISR_NF
+#endif
+	if (err & (USART_FLAG_ORE | USART_FLAG_FE | USART_SR_NE))
 		return;
 
 	/* Turn on LED */
@@ -260,7 +263,7 @@ enum {
 int rdi_write(int fn, const char *buf, size_t len)
 {
 	(void)fn;
-#if defined(PLATFORM_HAS_DEBUG) && !defined(PC_HOSTED)
+#if defined(PLATFORM_HAS_DEBUG)
 	if (debug_bmp)
 		return len - usbuart_debug_write(buf, len);
 #else

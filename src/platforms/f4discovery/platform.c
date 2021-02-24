@@ -27,7 +27,7 @@
 #include "usbuart.h"
 #include "morse.h"
 
-#include <libopencm3/stm32/f4/rcc.h>
+#include <libopencm3/stm32/rcc.h>
 #include <libopencm3/cm3/scb.h>
 #include <libopencm3/cm3/nvic.h>
 #include <libopencm3/stm32/exti.h>
@@ -38,11 +38,11 @@
 #include <libopencm3/cm3/cortex.h>
 
 jmp_buf fatal_error_jmpbuf;
-extern uint32_t _ebss;
+extern char _ebss[];
 
 void platform_init(void)
 {
-	volatile uint32_t *magic = (uint32_t *) &_ebss;
+	volatile uint32_t *magic = (uint32_t *)_ebss;
 	/* Check the USER button*/
 	rcc_periph_clock_enable(RCC_GPIOA);
 	if (gpio_get(GPIOA, GPIO0) ||
@@ -71,8 +71,8 @@ void platform_init(void)
 	rcc_periph_clock_enable(RCC_CRC);
 
 	/* Set up USB Pins and alternate function*/
-	gpio_mode_setup(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO11 | GPIO12);
-	gpio_set_af(GPIOA, GPIO_AF10, GPIO11 | GPIO12);
+	gpio_mode_setup(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE,  GPIO9 | GPIO11 | GPIO12);
+	gpio_set_af(GPIOA, GPIO_AF10, GPIO9 | GPIO10 | GPIO11 | GPIO12);
 
 	GPIOC_OSPEEDR &=~0xF30;
 	GPIOC_OSPEEDR |= 0xA20;
@@ -81,10 +81,13 @@ void platform_init(void)
 			TCK_PIN | TDI_PIN);
 	gpio_mode_setup(JTAG_PORT, GPIO_MODE_INPUT,
 			GPIO_PUPD_NONE, TMS_PIN);
-
+	gpio_set_output_options(JTAG_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_2MHZ,
+							TCK_PIN | TDI_PIN | TMS_PIN);
 	gpio_mode_setup(TDO_PORT, GPIO_MODE_INPUT,
 			GPIO_PUPD_NONE,
 			TDO_PIN);
+	gpio_set_output_options(TDO_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_2MHZ,
+							 TDO_PIN| TMS_PIN);
 
 	gpio_mode_setup(LED_PORT, GPIO_MODE_OUTPUT,
 			GPIO_PUPD_NONE,
@@ -100,7 +103,7 @@ bool platform_srst_get_val(void) { return false; }
 
 const char *platform_target_voltage(void)
 {
-	return "ABSENT!";
+	return NULL;
 }
 
 void platform_request_boot(void)

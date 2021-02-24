@@ -34,10 +34,14 @@ typedef struct target_s target;
 typedef uint32_t target_addr;
 struct target_controller;
 
-int adiv5_swdp_scan(void);
+#if PC_HOSTED == 1
+int platform_adiv5_swdp_scan(uint32_t targetid);
+int platform_jtag_scan(const uint8_t *lrlens);
+#endif
+int adiv5_swdp_scan(uint32_t targetid);
 int jtag_scan(const uint8_t *lrlens);
 
-bool target_foreach(void (*cb)(int i, target *t, void *context), void *context);
+int target_foreach(void (*cb)(int i, target *t, void *context), void *context);
 void target_list_free(void);
 
 /* Attach/detach functions */
@@ -47,6 +51,8 @@ void target_detach(target *t);
 bool target_attached(target *t);
 const char *target_driver_name(target *t);
 const char *target_core_name(target *t);
+unsigned int target_designer(target *t);
+unsigned int target_idcode(target *t);
 
 /* Memory access functions */
 bool target_mem_map(target *t, char *buf, size_t len);
@@ -80,6 +86,9 @@ void target_reset(target *t);
 void target_halt_request(target *t);
 enum target_halt_reason target_halt_poll(target *t, target_addr *watch);
 void target_halt_resume(target *t, bool step);
+void target_set_cmdline(target *t, char *cmdline);
+void target_set_heapinfo(target *t, target_addr heap_base, target_addr heap_limit,
+	target_addr stack_base, target_addr stack_limit);
 
 /* Break-/watchpoint functions */
 enum target_breakwatch {
@@ -96,11 +105,12 @@ int target_breakwatch_clear(target *t, enum target_breakwatch, target_addr, size
 void target_command_help(target *t);
 int target_command(target *t, int argc, const char *argv[]);
 
-
+/* keep target_errno in sync with errno values in gdb/include/gdb/fileio.h */
 enum target_errno {
 	TARGET_EPERM = 1,
 	TARGET_ENOENT = 2,
 	TARGET_EINTR = 4,
+	TARGET_EIO = 5,
 	TARGET_EBADF = 9,
 	TARGET_EACCES = 13,
 	TARGET_EFAULT = 14,
@@ -110,13 +120,15 @@ enum target_errno {
 	TARGET_ENOTDIR = 20,
 	TARGET_EISDIR = 21,
 	TARGET_EINVAL = 22,
-	TARGET_EMFILE = 24,
 	TARGET_ENFILE = 23,
+	TARGET_EMFILE = 24,
 	TARGET_EFBIG = 27,
 	TARGET_ENOSPC = 28,
 	TARGET_ESPIPE = 29,
 	TARGET_EROFS = 30,
-	TARGET_ENAMETOOLONG = 36,
+	TARGET_ENOSYS = 88,
+	TARGET_ENAMETOOLONG = 91,
+	TARGET_EUNKNOWN = 9999,
 };
 
 enum target_open_flags {
