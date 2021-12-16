@@ -42,16 +42,6 @@
 
 #include "cl_utils.h"
 
-#define VENDOR_ID_STLINK		0x483
-#define PRODUCT_ID_STLINK_MASK	0xffe0
-#define PRODUCT_ID_STLINK_GROUP 0x3740
-#define PRODUCT_ID_STLINKV1		0x3744
-#define PRODUCT_ID_STLINKV2		0x3748
-#define PRODUCT_ID_STLINKV21	0x374b
-#define PRODUCT_ID_STLINKV21_MSD 0x3752
-#define PRODUCT_ID_STLINKV3		0x374f
-#define PRODUCT_ID_STLINKV3E	0x374e
-
 #define STLINK_SWIM_ERR_OK             0x00
 #define STLINK_SWIM_BUSY               0x01
 #define STLINK_DEBUG_ERR_OK            0x80
@@ -399,6 +389,9 @@ static int write_retry(uint8_t *cmdbuf, size_t cmdsize,
 	return res;
 }
 
+/* Version data is at 0x080103f8 with STLINKV3 bootloader flashed with
+ * STLinkUpgrade_v3[3|5].jar
+ */
 static void stlink_version(bmp_info_t *info)
 {
 	if (Stlink.ver_hw == 30) {
@@ -543,20 +536,30 @@ int stlink_init(bmp_info_t *info)
 	libusb_free_device_list(devs, 1);
 	if (!found)
 		return 0;
-	if (info->pid == PRODUCT_ID_STLINKV2) {
+	if (info->vid != VENDOR_ID_STLINK)
+		return 0;
+	switch (info->pid) {
+	case PRODUCT_ID_STLINKV2:
 		Stlink.ver_hw = 20;
 		info->usb_link->ep_tx = 2;
 		Stlink.ep_tx = 2;
-	} else if ((info->pid == PRODUCT_ID_STLINKV21)||
-			   (info->pid == PRODUCT_ID_STLINKV21_MSD)) {
+		break;
+	case PRODUCT_ID_STLINKV21 :
+	case PRODUCT_ID_STLINKV21_MSD:
 		Stlink.ver_hw = 21;
 		info->usb_link->ep_tx = 1;
 		Stlink.ep_tx = 1;
-	} else if ((info->pid == PRODUCT_ID_STLINKV3) ||
-			   (info->pid == PRODUCT_ID_STLINKV3E)) {
+		break;
+	case PRODUCT_ID_STLINKV3_BL:
+	case PRODUCT_ID_STLINKV3:
+	case PRODUCT_ID_STLINKV3E:
+	case PRODUCT_ID_STLINKV3_NO_MSD:
 		Stlink.ver_hw = 30;
 		info->usb_link->ep_tx = 1;
 		Stlink.ep_tx = 1;
+		break;
+	default:
+		DEBUG_INFO("Unhandled STM32 device\n");
 	}
 	info->usb_link->ep_rx = 1;
 	int config;
@@ -761,9 +764,10 @@ uint32_t stlink_dp_low_access(ADIv5_DP_t *dp, uint8_t RnW,
 	int res;
 	if (RnW) {
 		res = stlink_read_dp_register(
-			STLINK_DEBUG_PORT_ACCESS, addr, &response);
+			(addr < 0x100) ? STLINK_DEBUG_PORT_ACCESS : 0, addr, &response);
 	} else {
-		res = stlink_write_dp_register(STLINK_DEBUG_PORT_ACCESS, addr, value);
+		res = stlink_write_dp_register(
+			(addr < 0x100) ? STLINK_DEBUG_PORT_ACCESS : 0, addr, value);
 	}
 	if (res == STLINK_ERROR_WAIT)
 		raise_exception(EXCEPTION_TIMEOUT, "DP ACK timeout");
@@ -1006,7 +1010,7 @@ int jtag_scan_stlinkv2(bmp_info_t *info, const uint8_t *irlens)
 			if((jtag_devs[i].jd_idcode & dev_descr[j].idmask) ==
 			   dev_descr[j].idcode) {
 				if(dev_descr[j].handler)
-					dev_descr[j].handler(i, dev_descr[j].idcode);
+					dev_descr[j].handler(&jtag_devs[i]);
 				break;
 			}
 
@@ -1046,7 +1050,7 @@ int stlink_enter_debug_swd(bmp_info_t *info, ADIv5_DP_t *dp)
 	uint8_t data[2];
 	stlink_send_recv_retry(cmd, 16, data, 2);
 	if (stlink_usb_error_check(data, true))
-		return -1;
+		exit( -1);
 	dp->idcode = stlink_read_coreid();
 	dp->dp_read = stlink_dp_read;
 	dp->error = stlink_dp_error;
@@ -1054,6 +1058,12 @@ int stlink_enter_debug_swd(bmp_info_t *info, ADIv5_DP_t *dp)
 	dp->abort = stlink_dp_abort;
 
 	stlink_dp_error(dp);
+	if ((dp->idcode & ADIV5_DP_VERSION_MASK) == ADIV5_DPv2) {
+		adiv5_dp_write(dp, ADIV5_DP_SELECT, 2);
+		dp->targetid = adiv5_dp_read(dp, ADIV5_DP_CTRLSTAT);
+		adiv5_dp_write(dp, ADIV5_DP_SELECT, 0);
+		DEBUG_INFO("TARGETID 0x%08" PRIx32 "\n", dp->targetid);
+	}
 	return 0;
 }
 

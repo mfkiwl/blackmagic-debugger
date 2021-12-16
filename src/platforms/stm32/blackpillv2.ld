@@ -1,8 +1,7 @@
 /*
- * This file is part of the Black Magic Debug project.
+ * This file is part of the libopenstm32 project.
  *
- * Copyright (C) 2011  Black Sphere Technologies Ltd.
- * Written by Gareth McMullin <gareth@blacksphere.co.nz>
+ * Copyright (C) 2010 Thomas Otto <tommi@viadmin.org>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -18,19 +17,12 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef __SWDPTAP_H
-#define __SWDPTAP_H
-typedef struct swd_proc_s {
-	uint32_t (*swdptap_seq_in)(int ticks);
-	bool (*swdptap_seq_in_parity)(uint32_t *data, int ticks);
-	void (*swdptap_seq_out)(uint32_t MS, int ticks);
-	void (*swdptap_seq_out_parity)(uint32_t MS, int ticks);
-} swd_proc_t;
-extern swd_proc_t swd_proc;
+/* Define memory regions. */
+MEMORY
+{
+	rom (rx) : ORIGIN = 0x08000000, LENGTH = 512K
+	ram (rwx) : ORIGIN = 0x20000000, LENGTH = 96K
+}
 
-# if PC_HOSTED == 1
-int platform_swdptap_init(void);
-# else
-int swdptap_init(void);
-# endif
-#endif
+/* Include the common ld script from libopenstm32. */
+INCLUDE cortex-m-generic.ld

@@ -20,7 +20,6 @@
  */
 #include "general.h"
 #include "gdb_if.h"
-#include "platform.h"
 #include "target.h"
 
 #include <assert.h>
@@ -28,7 +27,7 @@
 #include <sys/time.h>
 
 #include "ftdi_bmp.h"
-#include <libftdi1/ftdi.h>
+#include <ftdi.h>
 
 struct ftdi_context *ftdic;
 
@@ -124,8 +123,8 @@ cable_desc_t cable_desc[] = {
 		.init.ddr_low = PIN4,
 		.init.data_high = PIN4 | PIN3 | PIN2,
 		.init.ddr_high = PIN4 | PIN3 | PIN2 | PIN1 | PIN0,
-		.assert_srst.data_high   = ~PIN2,
-		.deassert_srst.data_high =  PIN2,
+		.assert_srst.data_high   = ~PIN3,
+		.deassert_srst.data_high =  PIN3,
 		.srst_get_port_cmd = GET_BITS_LOW,
 		.srst_get_pin = PIN6,
 		.description = "FTDIJTAG",
@@ -270,7 +269,7 @@ int ftdi_bmp_init(BMP_CL_OPTIONS_t *cl_opts, bmp_info_t *info)
 	int err;
 	cable_desc_t *cable = &cable_desc[0];
 	for(;  cable->name; cable++) {
-		if (strcmp(cable->name, cl_opts->opt_cable) == 0)
+		if (strncmp(cable->name, cl_opts->opt_cable, strlen(cable->name)) == 0)
 		 break;
 	}
 
@@ -282,7 +281,7 @@ int ftdi_bmp_init(BMP_CL_OPTIONS_t *cl_opts, bmp_info_t *info)
 	active_cable = cable;
 	memcpy(&active_state, &active_cable->init, sizeof(data_desc_t));
 	/* If swd_(read|write) is not given for the selected cable and
-	   the 'r' command line argument is give, assume resistor SWD
+	   the 'e' command line argument is give, assume resistor SWD
 	   connection.*/
 	if (cl_opts->external_resistor_swd &&
 		(active_cable->mpsse_swd_read.set_data_low  == 0) &&
@@ -380,7 +379,7 @@ int ftdi_bmp_init(BMP_CL_OPTIONS_t *cl_opts, bmp_info_t *info)
 	case TYPE_2232H:
 	case TYPE_4232H:
 	case TYPE_232H:
-		ftdi_init[index++] = EN_DIV_5;
+		ftdi_init[index++] = DIS_DIV_5;
 		break;
 	case TYPE_2232C:
 		break;
@@ -422,11 +421,11 @@ static void libftdi_set_data(data_desc_t* data)
 	if ((data->data_low) || (data->ddr_low)) {
 		if (data->data_low > 0)
 			active_state.data_low |= (data->data_low & 0xff);
-		else
+		else if (data->data_low < 0)
 			active_state.data_low &= (data->data_low & 0xff);
 		if (data->ddr_low > 0)
 			active_state.ddr_low  |= (data->ddr_low  & 0xff);
-		else
+		else if (data->ddr_low < 0)
 			active_state.ddr_low  &= (data->ddr_low  & 0xff);
 		cmd[index++] = SET_BITS_LOW;
 		cmd[index++] = active_state.data_low;
@@ -435,11 +434,11 @@ static void libftdi_set_data(data_desc_t* data)
 	if ((data->data_high) || (data->ddr_high)) {
 		if (data->data_high > 0)
 			active_state.data_high |= (data->data_high & 0xff);
-		else
+		else if (data->data_high < 0)
 			active_state.data_high &= (data->data_high & 0xff);
 		if (data->ddr_high > 0)
 			active_state.ddr_high  |= (data->ddr_high  & 0xff);
-		else
+		else if (data->ddr_high < 0)
 			active_state.ddr_high  &= (data->ddr_high  & 0xff);
 		cmd[index++] = SET_BITS_HIGH;
 		cmd[index++] = active_state.data_high;
@@ -553,7 +552,8 @@ void libftdi_jtagtap_tdi_tdo_seq(
 	if(!ticks) return;
 	if (!DI && !DO) return;
 
-//	printf("ticks: %d\n", ticks);
+	DEBUG_WIRE("libftdi_jtagtap_tdi_tdo_seq %s ticks: %d\n",
+			   (DI && DO) ? "read/write" : ((DI) ? "write" : "read"), ticks);
 	if(final_tms) ticks--;
 	rticks = ticks & 7;
 	ticks >>= 3;
@@ -583,7 +583,7 @@ void libftdi_jtagtap_tdi_tdo_seq(
 			MPSSE_LSB | MPSSE_BITMODE | MPSSE_WRITE_NEG;
 		data[index++] = 0;
 		if (DI)
-			data[index++] = (DI[ticks]) >> rticks?0x81 : 0x01;
+			data[index++] = (DI[ticks] & (1 << rticks)) ? 0x81 : 0x01;
 	}
 	if (index)
 		libftdi_buffer_write(data, index);
@@ -594,7 +594,6 @@ void libftdi_jtagtap_tdi_tdo_seq(
 		if(final_tms) rsize--;
 
 		while(rsize--) {
-			/*if(rsize) printf("%02X ", tmp[index]);*/
 			*DO++ = tmp[index++];
 		}
 		if (rticks == 0)
@@ -607,7 +606,6 @@ void libftdi_jtagtap_tdi_tdo_seq(
 		if(rticks) {
 			*DO >>= (8-rticks);
 		}
-		/*printf("%02X\n", *DO);*/
 	}
 }
 

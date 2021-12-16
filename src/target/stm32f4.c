@@ -160,7 +160,7 @@ static void stm32f4_add_flash(target *t,
 	target_add_flash(t, f);
 }
 
-char *stm32f4_get_chip_name(uint32_t idcode)
+static char *stm32f4_get_chip_name(uint32_t idcode)
 {
 	switch(idcode){
 	case ID_STM32F40X: /* F40XxE/G */
@@ -384,9 +384,9 @@ static int stm32f4_flash_erase(struct target_flash *f, target_addr addr,
 	stm32f4_flash_unlock(t);
 
 	enum align psize = ALIGN_WORD;
-	for (struct target_flash *f = t->flash; f; f = f->next) {
-		if (f->write == stm32f4_flash_write) {
-			psize = ((struct stm32f4_flash *)f)->psize;
+	for (struct target_flash *currf = t->flash; currf; currf = currf->next) {
+		if (currf->write == stm32f4_flash_write) {
+			psize = ((struct stm32f4_flash *)currf)->psize;
 		}
 	}
 	while(len) {
@@ -415,7 +415,7 @@ static int stm32f4_flash_erase(struct target_flash *f, target_addr addr,
 	/* Check for error */
 	sr = target_mem_read32(t, FLASH_SR);
 	if(sr & SR_ERROR_MASK) {
-		DEBUG_WARN("stm32f4 flash erase: sr error: 0x%" PRIu32 "\n", sr);
+		DEBUG_WARN("stm32f4 flash erase: sr error: 0x%" PRIx32 "\n", sr);
 		return -1;
 	}
 	return 0;

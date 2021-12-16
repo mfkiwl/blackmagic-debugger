@@ -38,8 +38,6 @@
 #	include "traceswo.h"
 #endif
 
-typedef bool (*cmd_handler)(target *t, int argc, const char **argv);
-
 static bool cmd_version(target *t, int argc, char **argv);
 static bool cmd_help(target *t, int argc, char **argv);
 
@@ -136,17 +134,17 @@ bool cmd_version(target *t, int argc, char **argv)
 	(void)t;
 	(void)argc;
 	(void)argv;
-	gdb_out(BOARD_IDENT);
 #if PC_HOSTED == 1
 	char ident[256];
 	gdb_ident(ident, sizeof(ident));
-	gdb_outf("\n for %s\n", ident);
+	DEBUG_WARN("%s\n", ident);
 #else
+	gdb_out(BOARD_IDENT);
 	gdb_outf(", Hardware Version %d\n", platform_hwversion());
-#endif
 	gdb_out("Copyright (C) 2015  Black Sphere Technologies Ltd.\n");
 	gdb_out("License GPLv3+: GNU GPL version 3 or later "
 		"<http://gnu.org/licenses/gpl.html>\n\n");
+#endif
 
 	return true;
 }
@@ -395,8 +393,15 @@ static bool cmd_target_power(target *t, int argc, const char **argv)
 	} else if (argc == 2) {
 		bool want_enable = false;
 		if (parse_enable_or_disable(argv[1], &want_enable)) {
-			platform_target_set_power(want_enable);
-			gdb_outf("%s target power\n", want_enable ? "Enabling" : "Disabling");
+			if (want_enable
+				&& !platform_target_get_power()
+				&& platform_target_voltage_sense() > POWER_CONFLICT_THRESHOLD) {
+				/* want to enable target power, but VREF > 0.5V sensed -> cancel */
+				gdb_outf("Target already powered (%s)\n", platform_target_voltage());
+			} else {
+				platform_target_set_power(want_enable);
+				gdb_outf("%s target power\n", want_enable ? "Enabling" : "Disabling");
+			}
 		}
 	} else {
 		gdb_outf("Unrecognized command format\n");
@@ -408,7 +413,7 @@ static bool cmd_target_power(target *t, int argc, const char **argv)
 #ifdef PLATFORM_HAS_TRACESWO
 static bool cmd_traceswo(target *t, int argc, const char **argv)
 {
-	char serial_no[13];
+	char serial_no[DFU_SERIAL_LENGTH];
 	(void)t;
 #if TRACESWO_PROTOCOL == 2
 	uint32_t baudrate = SWO_DEFAULT_BAUD;
@@ -454,7 +459,7 @@ static bool cmd_traceswo(target *t, int argc, const char **argv)
 #else
 	traceswo_init(swo_channelmask);
 #endif
-	serial_no_read(serial_no, sizeof(serial_no));
+	serial_no_read(serial_no);
 	gdb_outf("%s:%02X:%02X\n", serial_no, 5, 0x85);
 	return true;
 }

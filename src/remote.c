@@ -3,6 +3,7 @@
  *
  * Copyright (C) 2019  Black Sphere Technologies Ltd.
  * Written by Dave Marples <dave@marples.net>
+ * Modified 2020 - 2021 by Uwe Bonnes (bon@elektron.ikp.physik.tu-darmstadt.de)
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,10 +22,8 @@
 #include "general.h"
 #include "remote.h"
 #include "gdb_packet.h"
-#include "swdptap.h"
 #include "jtagtap.h"
 #include "gdb_if.h"
-#include "platform.h"
 #include "version.h"
 #include "exception.h"
 #include <stdarg.h>
@@ -134,7 +133,7 @@ static ADIv5_DP_t remote_dp = {
 };
 
 
-void remotePacketProcessSWD(uint8_t i, char *packet)
+static void remotePacketProcessSWD(unsigned i, char *packet)
 {
 	uint8_t ticks;
 	uint32_t param;
@@ -145,7 +144,8 @@ void remotePacketProcessSWD(uint8_t i, char *packet)
 		if (i==2) {
 			remote_dp.dp_read = firmware_swdp_read;
 			remote_dp.low_access = firmware_swdp_low_access;
-			swdptap_init();
+			remote_dp.abort = firmware_swdp_abort;
+			swdptap_init(&remote_dp);
 			_respond(REMOTE_RESP_OK, 0);
 		} else {
 			_respond(REMOTE_RESP_ERR,REMOTE_ERROR_WRONGLEN);
@@ -154,27 +154,27 @@ void remotePacketProcessSWD(uint8_t i, char *packet)
 
     case REMOTE_IN_PAR: /* SI = In parity ============================= */
 		ticks=remotehston(2,&packet[2]);
-		badParity = swd_proc.swdptap_seq_in_parity(&param, ticks);
+		badParity = remote_dp.seq_in_parity(&param, ticks);
 		_respond(badParity?REMOTE_RESP_PARERR:REMOTE_RESP_OK,param);
 		break;
 
     case REMOTE_IN: /* Si = In ======================================= */
 		ticks=remotehston(2,&packet[2]);
-		param = swd_proc.swdptap_seq_in(ticks);
+		param = remote_dp.seq_in(ticks);
 		_respond(REMOTE_RESP_OK,param);
 		break;
 
     case REMOTE_OUT: /* So= Out ====================================== */
 		ticks=remotehston(2,&packet[2]);
 		param=remotehston(-1, &packet[4]);
-		swd_proc.swdptap_seq_out(param, ticks);
+		remote_dp.seq_out(param, ticks);
 		_respond(REMOTE_RESP_OK, 0);
 		break;
 
     case REMOTE_OUT_PAR: /* SO = Out parity ========================== */
 		ticks=remotehston(2,&packet[2]);
 		param=remotehston(-1, &packet[4]);
-		swd_proc.swdptap_seq_out_parity(param, ticks);
+		remote_dp.seq_out_parity(param, ticks);
 		_respond(REMOTE_RESP_OK, 0);
 		break;
 
@@ -184,7 +184,7 @@ void remotePacketProcessSWD(uint8_t i, char *packet)
     }
 }
 
-void remotePacketProcessJTAG(uint8_t i, char *packet)
+static void remotePacketProcessJTAG(unsigned i, char *packet)
 {
 	uint32_t MS;
 	uint64_t DO;
@@ -195,6 +195,7 @@ void remotePacketProcessJTAG(uint8_t i, char *packet)
     case REMOTE_INIT: /* JS = initialise ============================= */
 		remote_dp.dp_read = fw_adiv5_jtagdp_read;
 		remote_dp.low_access = fw_adiv5_jtagdp_low_access;
+		remote_dp.abort = adiv5_jtagdp_abort;
 		jtagtap_init();
 		_respond(REMOTE_RESP_OK, 0);
 		break;
@@ -227,7 +228,8 @@ void remotePacketProcessJTAG(uint8_t i, char *packet)
 			jtag_proc.jtagtap_tdi_tdo_seq((void *)&DO, (packet[1]==REMOTE_TDITDO_TMS), (void *)&DI, ticks);
 
 			/* Mask extra bits on return value... */
-			DO &= (1LL << (ticks + 1)) - 1;
+			if (ticks < 64)
+				DO &= (1LL << ticks) - 1;
 
 			_respond(REMOTE_RESP_OK, DO);
 		}
@@ -265,7 +267,7 @@ void remotePacketProcessJTAG(uint8_t i, char *packet)
     }
 }
 
-void remotePacketProcessGEN(uint8_t i, char *packet)
+static void remotePacketProcessGEN(unsigned i, char *packet)
 
 {
 	(void)i;
@@ -294,8 +296,18 @@ void remotePacketProcessGEN(uint8_t i, char *packet)
 
     case REMOTE_PWR_SET:
 #ifdef PLATFORM_HAS_POWER_SWITCH
-		platform_target_set_power(packet[2]=='1');
-		_respond(REMOTE_RESP_OK,0);
+		if (packet[2]=='1'
+			&& !platform_target_get_power()
+			&& platform_target_voltage_sense() > POWER_CONFLICT_THRESHOLD)
+		{
+			/* want to enable target power, but voltage > 0.5V sensed
+			 * on the pin -> cancel
+			 */
+			_respond(REMOTE_RESP_ERR,0);
+		} else {
+			platform_target_set_power(packet[2]=='1');
+			_respond(REMOTE_RESP_OK,0);
+		}
 #else
 		_respond(REMOTE_RESP_NOTSUP,0);
 #endif
@@ -322,7 +334,7 @@ void remotePacketProcessGEN(uint8_t i, char *packet)
     }
 }
 
-void remotePacketProcessHL(uint8_t i, char *packet)
+static void remotePacketProcessHL(unsigned i, char *packet)
 
 {
 	(void)i;
@@ -426,7 +438,7 @@ void remotePacketProcessHL(uint8_t i, char *packet)
 }
 
 
-void remotePacketProcess(uint8_t i, char *packet)
+void remotePacketProcess(unsigned i, char *packet)
 {
 	switch (packet[0]) {
     case REMOTE_SWDP_PACKET:

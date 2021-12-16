@@ -31,7 +31,6 @@ SRC =			\
 	gdb_hostio.c	\
 	gdb_packet.c	\
 	hex_utils.c	\
-	jtag_devs.c	\
 	jtag_scan.c	\
 	lmi.c		\
 	lpc_common.c	\
@@ -48,6 +47,7 @@ SRC =			\
 	nxpke04.c	\
 	platform.c	\
 	remote.c	\
+	rp.c		\
 	sam3x.c		\
 	sam4l.c		\
 	samd.c		\
@@ -57,11 +57,12 @@ SRC =			\
 	stm32h7.c	\
 	stm32l0.c	\
 	stm32l4.c	\
+	stm32g0.c	\
 	target.c	\
 
 include $(PLATFORM_DIR)/Makefile.inc
 
-OPT_FLAGS ?= -Og
+OPT_FLAGS ?= -Os
 CFLAGS += $(OPT_FLAGS)
 LDFLAGS += $(OPT_FLAGS)
 
