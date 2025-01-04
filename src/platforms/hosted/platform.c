@@ -1,7 +1,9 @@
 /*
  * This file is part of the Black Magic Debug project.
  *
- * Copyright (C) 2020- 2021 Uwe Bonnes (bon@elektron.ikp.physik.tu-darmstadt.de)
+ * Copyright (C) 2020-2021 Uwe Bonnes (bon@elektron.ikp.physik.tu-darmstadt.de)
+ * Copyright (C) 2022-2023 1BitSquared <info@1bitsquared.com>
+ * Modified by Rachel Mant <git@dragonmux.network>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -17,47 +19,88 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-/* Handle different BMP pc-hosted platforms/
- */
+/* Implements core platform-specific functionality for BMDA */
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 #include "general.h"
+#include "platform.h"
 #include "jtagtap.h"
+#include "swd.h"
 #include "target.h"
 #include "target_internal.h"
 #include "adiv5.h"
+#include "riscv_debug.h"
 #include "timing.h"
-#include "cl_utils.h"
+#include "cli.h"
 #include "gdb_if.h"
+#include "gdb_packet.h"
 #include <signal.h>
+
+#ifdef ENABLE_RTT
+#include "rtt_if.h"
+#endif
 
 #include "bmp_remote.h"
 #include "bmp_hosted.h"
+#if HOSTED_BMP_ONLY == 0
 #include "stlinkv2.h"
 #include "ftdi_bmp.h"
 #include "jlink.h"
 #include "cmsis_dap.h"
-#include "cl_utils.h"
+#endif
 
-bmp_info_t info;
+#ifdef ENABLE_GPIOD
+#include "bmda_gpiod.h"
+#endif
 
-jtag_proc_t jtag_proc;
+bmda_probe_s bmda_probe_info;
 
-void gdb_ident(char *p, int count)
+#ifndef ENABLE_GPIOD
+jtag_proc_s jtag_proc;
+swd_proc_s swd_proc;
+#endif
+
+static uint32_t max_frequency = 4000000U;
+
+static bmda_cli_options_s cl_opts;
+
+void bmda_display_probe(void)
 {
-	snprintf(p, count, "%s (%s), %s", info.manufacturer, info.product,
-			 info.version);
+	gdb_outf("Using a %s (%s), %s\n", bmda_probe_info.product, bmda_probe_info.manufacturer, bmda_probe_info.version);
 }
 
 static void exit_function(void)
 {
-	libusb_exit_function(&info);
-	switch (info.bmp_type) {
-	case BMP_TYPE_CMSIS_DAP:
+#if HOSTED_BMP_ONLY == 0
+	if (bmda_probe_info.type == PROBE_TYPE_STLINK_V2)
+		stlink_deinit();
+#endif
+
+	libusb_exit_function(&bmda_probe_info);
+
+	switch (bmda_probe_info.type) {
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_CMSIS_DAP:
 		dap_exit_function();
 		break;
+#endif
+
 	default:
 		break;
 	}
+
+#ifdef ENABLE_RTT
+	rtt_if_exit();
+#endif
+#if HOSTED_BMP_ONLY == 0
+	if (bmda_probe_info.libusb_ctx)
+		libusb_exit(bmda_probe_info.libusb_ctx);
+#endif
 	fflush(stdout);
 }
 
@@ -68,482 +111,551 @@ static void sigterm_handler(int sig)
 	exit(0);
 }
 
-static	BMP_CL_OPTIONS_t cl_opts;
-
 void platform_init(int argc, char **argv)
 {
+#if defined(_WIN32) || defined(__CYGWIN__)
+	SetConsoleOutputCP(CP_UTF8);
+	if (setvbuf(stdout, NULL, _IONBF, 0) < 0) {
+		int err = errno;
+		fprintf(stderr, "%s: %s returns %s\n", __func__, "setvbuf()", strerror(err));
+	}
+#endif
 	cl_init(&cl_opts, argc, argv);
 	atexit(exit_function);
 	signal(SIGTERM, sigterm_handler);
 	signal(SIGINT, sigterm_handler);
-	if (cl_opts.opt_device) {
-		info.bmp_type = BMP_TYPE_BMP;
-	} else if (find_debuggers(&cl_opts, &info)) {
-		exit(-1);
-	}
-	bmp_ident(&info);
-	switch (info.bmp_type) {
-	case BMP_TYPE_BMP:
-		if (serial_open(&cl_opts, info.serial))
-			exit(-1);
-		remote_init();
+
+	if (cl_opts.opt_device)
+		bmda_probe_info.type = PROBE_TYPE_BMP;
+	else if (cl_opts.opt_gpio_map)
+		bmda_probe_info.type = PROBE_TYPE_GPIOD;
+	else if (!find_debuggers(&cl_opts, &bmda_probe_info))
+		exit(1);
+
+	if (cl_opts.opt_list_only)
+		exit(0);
+
+	bmp_ident(&bmda_probe_info);
+
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
+		if (!serial_open(&cl_opts, bmda_probe_info.serial) || !remote_init(cl_opts.opt_tpwr))
+			exit(1);
 		break;
-	case BMP_TYPE_STLINKV2:
-		if (stlink_init( &info))
-			exit(-1);
+
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_STLINK_V2:
+		if (!stlink_init())
+			exit(1);
 		break;
-	case BMP_TYPE_CMSIS_DAP:
-		if (dap_init( &info))
-			exit(-1);
+
+	case PROBE_TYPE_CMSIS_DAP:
+		if (!dap_init(cl_opts.opt_cmsisdap_allow_fallback))
+			exit(1);
 		break;
-	case BMP_TYPE_LIBFTDI:
-		if (ftdi_bmp_init(&cl_opts, &info))
-			exit(-1);
+
+	case PROBE_TYPE_FTDI:
+		if (!ftdi_bmp_init(&cl_opts))
+			exit(1);
 		break;
-	case BMP_TYPE_JLINK:
-		if (jlink_init(&info))
-			exit(-1);
+
+	case PROBE_TYPE_JLINK:
+		if (!jlink_init())
+			exit(1);
 		break;
+#endif
+
+#ifdef ENABLE_GPIOD
+	case PROBE_TYPE_GPIOD:
+		if (!bmda_gpiod_init(&cl_opts))
+			exit(1);
+		break;
+#endif
+
 	default:
-		exit(-1);
+		exit(1);
 	}
-	int ret = -1;
-	if (cl_opts.opt_mode != BMP_MODE_DEBUG) {
-		ret = cl_execute(&cl_opts);
-	} else {
+
+	if (cl_opts.opt_max_frequency)
+		max_frequency = cl_opts.opt_max_frequency;
+
+	if (cl_opts.opt_mode != BMP_MODE_DEBUG)
+		exit(cl_execute(&cl_opts));
+	else {
 		gdb_if_init();
-		return;
+
+#ifdef ENABLE_RTT
+		rtt_if_init();
+#endif
 	}
-	exit(ret);
 }
 
-int platform_adiv5_swdp_scan(uint32_t targetid)
+bool bmda_swd_scan(const uint32_t targetid)
 {
-	info.is_jtag = false;
-	platform_max_frequency_set(cl_opts.opt_max_swj_frequency);
-	switch (info.bmp_type) {
-	case BMP_TYPE_BMP:
-	case BMP_TYPE_LIBFTDI:
-	case BMP_TYPE_CMSIS_DAP:
-		return adiv5_swdp_scan(targetid);
-		break;
-	case BMP_TYPE_STLINKV2:
-	{
-		target_list_free();
-		ADIv5_DP_t *dp = (void*)calloc(1, sizeof(*dp));
-		if (stlink_enter_debug_swd(&info, dp)) {
-			free(dp);
-		} else {
-			adiv5_dp_init(dp);
-			if (target_list)
-				return 1;
-		}
-		break;
-	}
-	case BMP_TYPE_JLINK:
-		return jlink_swdp_scan(&info);
+	bmda_probe_info.is_jtag = false;
+	platform_max_frequency_set(max_frequency);
+
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
+	case PROBE_TYPE_FTDI:
+	case PROBE_TYPE_CMSIS_DAP:
+	case PROBE_TYPE_JLINK:
+#ifdef ENABLE_GPIOD
+	case PROBE_TYPE_GPIOD:
+#endif
+		return adiv5_swd_scan(targetid);
+
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_STLINK_V2:
+		return stlink_swd_scan();
+#endif
+
 	default:
-		return 0;
+		return false;
 	}
-	return 0;
 }
 
-int swdptap_init(ADIv5_DP_t *dp)
+bool bmda_swd_dp_init(adiv5_debug_port_s *dp)
 {
-	switch (info.bmp_type) {
-	case BMP_TYPE_BMP:
-		return remote_swdptap_init(dp);
-	case BMP_TYPE_CMSIS_DAP:
-		return dap_swdptap_init(dp);
-	case BMP_TYPE_STLINKV2:
-	case BMP_TYPE_JLINK:
-		return 0;
-	case BMP_TYPE_LIBFTDI:
-		return libftdi_swdptap_init(dp);
+#if HOSTED_BMP_ONLY == 1
+	(void)dp;
+#endif
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
+		return remote_swd_init();
+
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_CMSIS_DAP:
+		return dap_swd_init(dp);
+
+	case PROBE_TYPE_STLINK_V2:
+		return false;
+
+	case PROBE_TYPE_JLINK:
+		return jlink_swd_init(dp);
+
+	case PROBE_TYPE_FTDI:
+		return ftdi_swd_init();
+#endif
+
+#ifdef ENABLE_GPIOD
+	case PROBE_TYPE_GPIOD:
+		return bmda_gpiod_swd_init();
+#endif
+
 	default:
-		return -1;
+		return false;
 	}
-	return -1;
 }
 
-void platform_add_jtag_dev(int i, const jtag_dev_t *jtag_dev)
+void bmda_add_jtag_dev(const uint32_t dev_index, const jtag_dev_s *const jtag_dev)
 {
-	if (info.bmp_type == BMP_TYPE_BMP)
-		remote_add_jtag_dev(i, jtag_dev);
+	if (bmda_probe_info.type == PROBE_TYPE_BMP)
+		remote_add_jtag_dev(dev_index, jtag_dev);
 }
 
-int platform_jtag_scan(const uint8_t *lrlens)
+bool bmda_jtag_scan(void)
 {
-	info.is_jtag = true;
-	platform_max_frequency_set(cl_opts.opt_max_swj_frequency);
-	switch (info.bmp_type) {
-	case BMP_TYPE_BMP:
-	case BMP_TYPE_LIBFTDI:
-	case BMP_TYPE_JLINK:
-	case BMP_TYPE_CMSIS_DAP:
-		return jtag_scan(lrlens);
-	case BMP_TYPE_STLINKV2:
-		return jtag_scan_stlinkv2(&info, lrlens);
+	bmda_probe_info.is_jtag = true;
+	platform_max_frequency_set(max_frequency);
+
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
+	case PROBE_TYPE_FTDI:
+	case PROBE_TYPE_JLINK:
+	case PROBE_TYPE_CMSIS_DAP:
+#ifdef ENABLE_GPIOD
+	case PROBE_TYPE_GPIOD:
+#endif
+		return jtag_scan();
+
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_STLINK_V2:
+		return stlink_jtag_scan();
+#endif
+
 	default:
-		return -1;
+		return false;
 	}
-	return -1;
 }
 
-int platform_jtagtap_init(void)
+bool bmda_jtag_init(void)
 {
-	switch (info.bmp_type) {
-	case BMP_TYPE_BMP:
-		return remote_jtagtap_init(&jtag_proc);
-	case BMP_TYPE_STLINKV2:
-		return 0;
-	case BMP_TYPE_LIBFTDI:
-		return libftdi_jtagtap_init(&jtag_proc);
-	case BMP_TYPE_JLINK:
-		return jlink_jtagtap_init(&info, &jtag_proc);
-	case BMP_TYPE_CMSIS_DAP:
-		return cmsis_dap_jtagtap_init(&jtag_proc);
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
+		return remote_jtag_init();
+
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_STLINK_V2:
+		return false;
+
+	case PROBE_TYPE_FTDI:
+		return ftdi_jtag_init();
+
+	case PROBE_TYPE_JLINK:
+		return jlink_jtag_init();
+
+	case PROBE_TYPE_CMSIS_DAP:
+		return dap_jtag_init();
+#endif
+
+#ifdef ENABLE_GPIOD
+	case PROBE_TYPE_GPIOD:
+		return bmda_gpiod_jtag_init();
+#endif
+
 	default:
-		return -1;
+		return false;
 	}
-	return -1;
 }
 
-void platform_adiv5_dp_defaults(ADIv5_DP_t *dp)
+void bmda_adiv5_dp_init(adiv5_debug_port_s *const dp)
 {
-	dp->dp_bmp_type = info.bmp_type;
-	switch (info.bmp_type) {
-	case BMP_TYPE_BMP:
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
 		if (cl_opts.opt_no_hl) {
-			DEBUG_WARN("Not using HL commands\n");
-			return;
+			DEBUG_WARN("Not using ADIv5 acceleration commands\n");
+			break;
 		}
-		return remote_adiv5_dp_defaults(dp);
-	case BMP_TYPE_STLINKV2:
-		return stlink_adiv5_dp_defaults(dp);
-	case BMP_TYPE_CMSIS_DAP:
-		return dap_adiv5_dp_defaults(dp);
+		remote_adiv5_dp_init(dp);
+		break;
+
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_STLINK_V2:
+		stlink_adiv5_dp_init(dp);
+		break;
+
+	case PROBE_TYPE_CMSIS_DAP:
+		dap_adiv5_dp_init(dp);
+		break;
+#endif
+
 	default:
 		break;
 	}
 }
 
-int platform_jtag_dp_init(ADIv5_DP_t *dp)
+void bmda_adiv6_dp_init(adiv5_debug_port_s *const dp)
 {
-	switch (info.bmp_type) {
-	case BMP_TYPE_BMP:
-	case BMP_TYPE_LIBFTDI:
-	case BMP_TYPE_JLINK:
-		return 0;
-	case BMP_TYPE_STLINKV2:
-		return stlink_jtag_dp_init(dp);
-	case BMP_TYPE_CMSIS_DAP:
-		return dap_jtag_dp_init(dp);
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
+		if (cl_opts.opt_no_hl) {
+			DEBUG_WARN("Not using ADIv6 acceleration commands\n");
+			break;
+		}
+		remote_adiv6_dp_init(dp);
+		break;
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_CMSIS_DAP:
+		dap_adiv6_dp_init(dp);
+		break;
+#endif
+
 	default:
-		return 0;
+		break;
 	}
-	return 0;
 }
 
-char *platform_ident(void)
+void bmda_jtag_dp_init(adiv5_debug_port_s *const dp)
 {
-	switch (info.bmp_type) {
-	  case BMP_TYPE_NONE:
-		return "NONE";
-	  case BMP_TYPE_BMP:
-		return "BMP";
-	  case BMP_TYPE_STLINKV2:
-		return "STLINKV2";
-	  case BMP_TYPE_LIBFTDI:
-		return "LIBFTDI";
-	  case BMP_TYPE_CMSIS_DAP:
-		return "CMSIS_DAP";
-	  case BMP_TYPE_JLINK:
-		return "JLINK";
+#if HOSTED_BMP_ONLY == 0
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_STLINK_V2:
+		stlink_jtag_dp_init(dp);
+		break;
+	case PROBE_TYPE_CMSIS_DAP:
+		dap_jtag_dp_init(dp);
+		break;
+	default:
+		break;
 	}
-	return NULL;
+#else
+	(void)dp;
+#endif
+}
+
+void bmda_riscv_jtag_dtm_init(riscv_dmi_s *const dmi)
+{
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
+		if (cl_opts.opt_no_hl) {
+			DEBUG_WARN("Not using RISC-V Debug acceleration commands\n");
+			break;
+		}
+		remote_riscv_jtag_dtm_init(dmi);
+		break;
+
+	default:
+		break;
+	}
+}
+
+char *bmda_adaptor_ident(void)
+{
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_NONE:
+		return "None";
+
+	case PROBE_TYPE_BMP:
+		return "BMP";
+
+	case PROBE_TYPE_STLINK_V2:
+		return "ST-Link v2";
+
+	case PROBE_TYPE_FTDI:
+		return "FTDI";
+
+	case PROBE_TYPE_CMSIS_DAP:
+		return "CMSIS-DAP";
+
+	case PROBE_TYPE_JLINK:
+		return "J-Link";
+
+	case PROBE_TYPE_GPIOD:
+		return "GPIOD";
+
+	default:
+		return NULL;
+	}
 }
 
 const char *platform_target_voltage(void)
 {
-	switch (info.bmp_type) {
-	case BMP_TYPE_BMP:
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
 		return remote_target_voltage();
-	case BMP_TYPE_STLINKV2:
-		return stlink_target_voltage(&info);
-	case BMP_TYPE_LIBFTDI:
-		return libftdi_target_voltage();
-	case BMP_TYPE_JLINK:
-		return jlink_target_voltage(&info);
+
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_STLINK_V2:
+		return stlink_target_voltage();
+
+	case PROBE_TYPE_FTDI:
+		return ftdi_target_voltage();
+
+	case PROBE_TYPE_JLINK:
+		return jlink_target_voltage_string();
+#endif
+
 	default:
-		break;
+		return "Unknown";
 	}
-	return NULL;
 }
 
-void platform_srst_set_val(bool assert)
+void platform_nrst_set_val(bool assert)
 {
-	switch (info.bmp_type) {
-	case BMP_TYPE_STLINKV2:
-		return stlink_srst_set_val(&info, assert);
-	case BMP_TYPE_BMP:
-		return remote_srst_set_val(assert);
-	case BMP_TYPE_JLINK:
-		return jlink_srst_set_val(&info, assert);
-	case BMP_TYPE_LIBFTDI:
-		return libftdi_srst_set_val(assert);
-	case BMP_TYPE_CMSIS_DAP:
-		return dap_srst_set_val(assert);
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
+		remote_nrst_set_val(assert);
+		break;
+
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_STLINK_V2:
+		stlink_nrst_set_val(assert);
+		break;
+
+	case PROBE_TYPE_JLINK:
+		jlink_nrst_set_val(assert);
+		break;
+
+	case PROBE_TYPE_FTDI:
+		libftdi_nrst_set_val(assert);
+		break;
+
+	case PROBE_TYPE_CMSIS_DAP:
+		dap_nrst_set_val(assert);
+		break;
+#endif
+
 	default:
 		break;
 	}
 }
 
-bool platform_srst_get_val(void)
+bool platform_nrst_get_val(void)
 {
-	switch (info.bmp_type) {
-	case BMP_TYPE_BMP:
-		return remote_srst_get_val();
-	case BMP_TYPE_STLINKV2:
-		return stlink_srst_get_val();
-	case BMP_TYPE_JLINK:
-		return jlink_srst_get_val(&info);
-	case BMP_TYPE_LIBFTDI:
-		return libftdi_srst_get_val();
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
+		return remote_nrst_get_val();
+
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_STLINK_V2:
+		return stlink_nrst_get_val();
+
+	case PROBE_TYPE_JLINK:
+		return jlink_nrst_get_val();
+
+	case PROBE_TYPE_FTDI:
+		return ftdi_nrst_get_val();
+#endif
+
 	default:
-		break;
+		return false;
 	}
-	return false;
 }
 
-void platform_max_frequency_set(uint32_t freq)
+void platform_max_frequency_set(const uint32_t freq)
 {
 	if (!freq)
 		return;
-	switch (info.bmp_type) {
-	case BMP_TYPE_BMP:
+
+	// Remember the frequency we were asked to set,
+	// this will be re-set every time a scan is issued.
+	max_frequency = freq;
+
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
 		remote_max_frequency_set(freq);
 		break;
-	case BMP_TYPE_CMSIS_DAP:
-		dap_swj_clock(freq);
+
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_CMSIS_DAP:
+		dap_max_frequency(freq);
 		break;
-	case BMP_TYPE_LIBFTDI:
-		libftdi_max_frequency_set(freq);
+
+	case PROBE_TYPE_FTDI:
+		ftdi_max_frequency_set(freq);
 		break;
-	case BMP_TYPE_STLINKV2:
-		stlink_max_frequency_set(&info, freq);
+
+	case PROBE_TYPE_STLINK_V2:
+		stlink_max_frequency_set(freq);
 		break;
-	case BMP_TYPE_JLINK:
-		jlink_max_frequency_set(&info, freq);
+
+	case PROBE_TYPE_JLINK:
+		jlink_max_frequency_set(freq);
 		break;
+#endif
+
 	default:
-		DEBUG_WARN("Setting max SWJ frequency not yet implemented\n");
+		DEBUG_WARN("Setting max debug interface frequency not available or not yet implemented\n");
 		break;
 	}
-	uint32_t max_freq = platform_max_frequency_get();
-	if (max_freq == FREQ_FIXED)
-		DEBUG_INFO("Device has fixed frequency for %s\n",
-				   (info.is_jtag) ? "JTAG" : "SWD" );
-	else
-		DEBUG_INFO("Speed set to %7.4f MHz for %s\n",
-				   platform_max_frequency_get() / 1000000.0,
-				   (info.is_jtag) ? "JTAG" : "SWD" );
+
+	const uint32_t actual_freq = platform_max_frequency_get();
+	if (actual_freq == FREQ_FIXED)
+		DEBUG_INFO("Device has fixed frequency for %s\n", bmda_probe_info.is_jtag ? "JTAG" : "SWD");
+	else if (actual_freq != 0) {
+		const uint16_t freq_mhz = actual_freq / 1000000U;
+		const uint16_t freq_khz = (actual_freq / 1000U) - (freq_mhz * 1000U);
+		DEBUG_INFO("Speed set to %u.%03uMHz for %s\n", freq_mhz, freq_khz, bmda_probe_info.is_jtag ? "JTAG" : "SWD");
+	}
 }
 
 uint32_t platform_max_frequency_get(void)
 {
-	switch (info.bmp_type) {
-	case BMP_TYPE_BMP:
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
 		return remote_max_frequency_get();
-	case BMP_TYPE_CMSIS_DAP:
-		return dap_swj_clock(0);
-		break;
-	case BMP_TYPE_LIBFTDI:
+
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_CMSIS_DAP:
+		return dap_max_frequency(0);
+
+	case PROBE_TYPE_FTDI:
 		return libftdi_max_frequency_get();
-	case BMP_TYPE_STLINKV2:
-		return stlink_max_frequency_get(&info);
-	case BMP_TYPE_JLINK:
-		return jlink_max_frequency_get(&info);
+
+	case PROBE_TYPE_STLINK_V2:
+		return stlink_max_frequency_get();
+
+	case PROBE_TYPE_JLINK:
+		return jlink_max_frequency_get();
+#endif
+
 	default:
-		DEBUG_WARN("Reading max SWJ frequency not yet implemented\n");
-		break;
+		DEBUG_WARN("Reading max debug interface frequency not available or not yet implemented\n");
+		return 0;
 	}
-	return false;
 }
 
-void platform_target_set_power(bool power)
+bool platform_target_set_power(const bool power)
 {
-	switch (info.bmp_type) {
-	case BMP_TYPE_BMP:
-		if (remote_target_set_power(power))
-			DEBUG_INFO("Powering up device!\n");
-		else
-			DEBUG_WARN("Powering up device unimplemented or failed\n");
-	   break;
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
+		return remote_target_set_power(power);
+
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_JLINK:
+		return jlink_target_set_power(power);
+#endif
+
+	default:
+		DEBUG_ERROR("Target power not available or not yet implemented\n");
+		return false;
+	}
+}
+
+bool platform_target_get_power(void)
+{
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
+		return remote_target_get_power();
+
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_JLINK:
+		return jlink_target_get_power();
+#endif
+
+	default:
+		return false;
+	}
+}
+
+uint32_t platform_target_voltage_sense(void)
+{
+	uint32_t target_voltage = 0;
+
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP: {
+		const char *const result = remote_target_voltage();
+		if (result != NULL) {
+			uint32_t units = 0;
+			uint32_t tenths = 0;
+			sscanf(result, "%" PRIu32 ".%" PRIu32, &units, &tenths);
+			target_voltage = (units * 10U) + tenths;
+		}
+		break;
+	}
+
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_JLINK:
+		target_voltage = jlink_target_voltage_sense();
+		break;
+#endif
+
 	default:
 		break;
 	}
+
+	return target_voltage;
 }
 
 void platform_buffer_flush(void)
 {
-	switch (info.bmp_type) {
-	case BMP_TYPE_LIBFTDI:
-		return libftdi_buffer_flush();
+	switch (bmda_probe_info.type) {
+#if HOSTED_BMP_ONLY == 0
+	case PROBE_TYPE_FTDI:
+		ftdi_buffer_flush();
+		break;
+#endif
+
 	default:
 		break;
 	}
 }
 
-static void ap_decode_access(uint16_t addr, uint8_t RnW)
+void platform_pace_poll(void)
 {
-	if (RnW)
-		fprintf(stderr, "Read  ");
-	else
-		fprintf(stderr, "Write ");
-	if (addr < 0x100) {
-		switch(addr) {
-		case 0x00:
-			if (RnW)
-				fprintf(stderr, "DP_DPIDR :");
-			else
-				fprintf(stderr, "DP_ABORT :");
-			break;
-		case 0x04: fprintf(stderr, "CTRL/STAT:");
-			break;
-		case 0x08:
-			if (RnW)
-				fprintf(stderr, "RESEND   :");
-			else
-				fprintf(stderr, "DP_SELECT:");
-			break;
-		case 0x0c: fprintf(stderr, "DP_RDBUFF:");
-			break;
-		default: fprintf(stderr, "Unknown %02x   :", addr);
-		}
-	} else {
-		fprintf(stderr, "AP 0x%02x ", addr >> 8);
-		switch (addr & 0xff) {
-		case 0x00: fprintf(stderr, "CSW   :");
-			break;
-		case 0x04: fprintf(stderr, "TAR   :");
-			break;
-		case 0x0c: fprintf(stderr, "DRW   :");
-			break;
-		case 0x10: fprintf(stderr, "DB0   :");
-			break;
-		case 0x14: fprintf(stderr, "DB1   :");
-			break;
-		case 0x18: fprintf(stderr, "DB2   :");
-			break;
-		case 0x1c: fprintf(stderr, "DB3   :");
-			break;
-		case 0xf8: fprintf(stderr, "BASE  :");
-			break;
-		case 0xf4: fprintf(stderr, "CFG   :");
-			break;
-		case 0xfc: fprintf(stderr, "IDR   :");
-			break;
-		default:   fprintf(stderr, "RSVD%02x:", addr & 0xff);
-		}
-	}
+	if (!cl_opts.fast_poll)
+		platform_delay(8);
 }
 
-void adiv5_dp_write(ADIv5_DP_t *dp, uint16_t addr, uint32_t value)
+void platform_target_clk_output_enable(const bool enable)
 {
-	if (cl_debuglevel & BMP_DEBUG_TARGET) {
-		ap_decode_access(addr, ADIV5_LOW_WRITE);
-		fprintf(stderr, " 0x%08" PRIx32 "\n", value);
-	}
-	dp->low_access(dp, ADIV5_LOW_WRITE, addr, value);
-}
+	switch (bmda_probe_info.type) {
+	case PROBE_TYPE_BMP:
+		remote_target_clk_output_enable(enable);
+		break;
 
-uint32_t adiv5_dp_read(ADIv5_DP_t *dp, uint16_t addr)
-{
-	uint32_t ret = dp->dp_read(dp, addr);
-	if (cl_debuglevel & BMP_DEBUG_TARGET) {
-		ap_decode_access(addr, ADIV5_LOW_READ);
-		fprintf(stderr, " 0x%08" PRIx32 "\n", ret);
+	default:
+		break;
 	}
-	return ret;
-}
-
-uint32_t adiv5_dp_error(ADIv5_DP_t *dp)
-{
-	uint32_t ret = dp->error(dp);
-	DEBUG_TARGET( "DP Error 0x%08" PRIx32 "\n", ret);
-	return ret;
-}
-
-uint32_t adiv5_dp_low_access(struct ADIv5_DP_s *dp, uint8_t RnW,
-							 uint16_t addr, uint32_t value)
-{
-	uint32_t ret = dp->low_access(dp, RnW, addr, value);
-	if (cl_debuglevel & BMP_DEBUG_TARGET) {
-		ap_decode_access(addr, RnW);
-		fprintf(stderr, " 0x%08" PRIx32 "\n", (RnW)? ret : value);
-	}
-	return ret;
-}
-
-uint32_t adiv5_ap_read(ADIv5_AP_t *ap, uint16_t addr)
-{
-	uint32_t ret = ap->dp->ap_read(ap, addr);
-	if (cl_debuglevel & BMP_DEBUG_TARGET) {
-		ap_decode_access(addr, ADIV5_LOW_READ);
-		fprintf(stderr, " 0x%08" PRIx32 "\n", ret);
-	}
-	return ret;
-}
-
-void adiv5_ap_write(ADIv5_AP_t *ap, uint16_t addr, uint32_t value)
-{
-	if (cl_debuglevel & BMP_DEBUG_TARGET) {
-		ap_decode_access(addr, ADIV5_LOW_WRITE);
-		fprintf(stderr, " 0x%08" PRIx32 "\n", value);
-	}
-	return ap->dp->ap_write(ap, addr, value);
-}
-
-void adiv5_mem_read(ADIv5_AP_t *ap, void *dest, uint32_t src, size_t len)
-{
-	ap->dp->mem_read(ap, dest, src, len);
-	if (cl_debuglevel & BMP_DEBUG_TARGET) {
-		fprintf(stderr, "ap_memread @ %" PRIx32 " len %" PRIx32 ":",
-				src, (uint32_t)len);
-		uint8_t *p = (uint8_t *) dest;
-		unsigned int i = len;
-		if (i > 16)
-			i = 16;
-		while (i--)
-			fprintf(stderr, " %02x", *p++);
-		if (len > 16)
-			fprintf(stderr, " ...");
-		fprintf(stderr, "\n");
-	}
-	return;
-}
-void adiv5_mem_write_sized(	ADIv5_AP_t *ap, uint32_t dest, const void *src,
-							size_t len, enum align align)
-{
-	if (cl_debuglevel & BMP_DEBUG_TARGET) {
-		fprintf(stderr, "ap_mem_write_sized @ %" PRIx32 " len %" PRIx32
-				", align %d:", dest, (uint32_t)len, 1 << align);
-		uint8_t *p = (uint8_t *) src;
-		unsigned int i = len;
-		if (i > 16)
-			i = 16;
-		while (i--)
-			fprintf(stderr, " %02x", *p++);
-		if (len > 16)
-			fprintf(stderr, " ...");
-		fprintf(stderr, "\n");
-	}
-	return ap->dp->mem_write_sized(ap, dest, src, len, align);
-}
-
-void adiv5_dp_abort(struct ADIv5_DP_s *dp, uint32_t abort)
-{
-	DEBUG_TARGET("Abort: %08" PRIx32 "\n", abort);
-	return dp->abort(dp, abort);
 }

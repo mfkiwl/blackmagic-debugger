@@ -22,91 +22,107 @@
  * implemented by a target driver when a supported device is detected.
  */
 
-#ifndef __TARGET_H
-#define __TARGET_H
+#ifndef INCLUDE_TARGET_H
+#define INCLUDE_TARGET_H
 
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/types.h>
 
-typedef struct target_s target;
-typedef uint32_t target_addr;
-struct target_controller;
+#if defined(_MSC_VER)
+#include <basetsd.h>
+typedef SSIZE_T ssize_t;
+typedef int32_t mode_t;
+#endif /* _MSC_VER */
 
-#if PC_HOSTED == 1
-int platform_adiv5_swdp_scan(uint32_t targetid);
-int platform_jtag_scan(const uint8_t *lrlens);
+typedef struct target target_s;
+typedef uint32_t target_addr32_t;
+typedef uint64_t target_addr64_t;
+typedef target_addr32_t target_addr_t;
+typedef struct target_controller target_controller_s;
+
+#if CONFIG_BMDA == 1
+bool bmda_swd_scan(uint32_t targetid);
+bool bmda_jtag_scan(void);
 #endif
-int adiv5_swdp_scan(uint32_t targetid);
-int jtag_scan(const uint8_t *lrlens);
+bool adiv5_swd_scan(uint32_t targetid);
+bool jtag_scan(void);
 
-int target_foreach(void (*cb)(int i, target *t, void *context), void *context);
+size_t target_foreach(void (*callback)(size_t index, target_s *target, void *context), void *context);
 void target_list_free(void);
 
+target_s *target_new(void);
+
 /* Attach/detach functions */
-target *target_attach(target *t, struct target_controller *);
-target *target_attach_n(int n, struct target_controller *);
-void target_detach(target *t);
-bool target_attached(target *t);
-const char *target_driver_name(target *t);
-const char *target_core_name(target *t);
-unsigned int target_designer(target *t);
-unsigned int target_idcode(target *t);
+target_s *target_attach(target_s *target, target_controller_s *controller);
+target_s *target_attach_n(size_t n, target_controller_s *controller);
+void target_detach(target_s *target);
 
 /* Memory access functions */
-bool target_mem_map(target *t, char *buf, size_t len);
-int target_mem_read(target *t, void *dest, target_addr src, size_t len);
-int target_mem_write(target *t, target_addr dest, const void *src, size_t len);
+bool target_mem_map(target_s *target, char *buf, size_t len);
+bool target_mem32_read(target_s *target, void *dest, target_addr_t src, size_t len);
+bool target_mem64_read(target_s *target, void *dest, target_addr64_t src, size_t len);
+bool target_mem32_write(target_s *target, target_addr_t dest, const void *src, size_t len);
+bool target_mem64_write(target_s *target, target_addr64_t dest, const void *src, size_t len);
+bool target_mem_access_needs_halt(target_s *target);
 /* Flash memory access functions */
-int target_flash_erase(target *t, target_addr addr, size_t len);
-int target_flash_write(target *t, target_addr dest, const void *src, size_t len);
-int target_flash_done(target *t);
+bool target_flash_erase(target_s *target, target_addr_t addr, size_t len);
+bool target_flash_write(target_s *target, target_addr_t dest, const void *src, size_t len);
+bool target_flash_complete(target_s *target);
+bool target_flash_mass_erase(target_s *target);
 
 /* Register access functions */
-size_t target_regs_size(target *t);
-const char *target_tdesc(target *t);
-void target_regs_read(target *t, void *data);
-void target_regs_write(target *t, const void *data);
-ssize_t target_reg_read(target *t, int reg, void *data, size_t max);
-ssize_t target_reg_write(target *t, int reg, const void *data, size_t size);
+size_t target_regs_size(target_s *target);
+const char *target_regs_description(target_s *target);
+void target_regs_read(target_s *target, void *data);
+void target_regs_write(target_s *target, const void *data);
+size_t target_reg_read(target_s *target, uint32_t reg, void *data, size_t max);
+size_t target_reg_write(target_s *target, uint32_t reg, const void *data, size_t size);
 
 /* Halt/resume functions */
-enum target_halt_reason {
+typedef enum target_halt_reason {
 	TARGET_HALT_RUNNING = 0, /* Target not halted */
 	TARGET_HALT_ERROR,       /* Failed to read target status */
 	TARGET_HALT_REQUEST,
 	TARGET_HALT_STEPPING,
+	/*
+	 * Used to both indicate that the target hit a breakpoint, and to
+	 * indicate that the target hit a watchpoint but we can't figure out which
+	 */
 	TARGET_HALT_BREAKPOINT,
+	/* Used to indicate the target hit a watchpoint and we know which */
 	TARGET_HALT_WATCHPOINT,
 	TARGET_HALT_FAULT,
-};
+} target_halt_reason_e;
 
-void target_reset(target *t);
-void target_halt_request(target *t);
-enum target_halt_reason target_halt_poll(target *t, target_addr *watch);
-void target_halt_resume(target *t, bool step);
-void target_set_cmdline(target *t, char *cmdline);
-void target_set_heapinfo(target *t, target_addr heap_base, target_addr heap_limit,
-	target_addr stack_base, target_addr stack_limit);
+void target_reset(target_s *target);
+void target_halt_request(target_s *target);
+target_halt_reason_e target_halt_poll(target_s *target, target_addr_t *watch);
+void target_halt_resume(target_s *target, bool step);
+void target_set_cmdline(target_s *target, const char *cmdline, size_t cmdline_len);
+void target_set_heapinfo(target_s *target, target_addr_t heap_base, target_addr_t heap_limit, target_addr_t stack_base,
+	target_addr_t stack_limit);
 
 /* Break-/watchpoint functions */
-enum target_breakwatch {
+typedef enum target_breakwatch {
 	TARGET_BREAK_SOFT,
 	TARGET_BREAK_HARD,
 	TARGET_WATCH_WRITE,
 	TARGET_WATCH_READ,
 	TARGET_WATCH_ACCESS,
-};
-int target_breakwatch_set(target *t, enum target_breakwatch, target_addr, size_t);
-int target_breakwatch_clear(target *t, enum target_breakwatch, target_addr, size_t);
+} target_breakwatch_e;
+
+int target_breakwatch_set(target_s *target, target_breakwatch_e type, target_addr_t addr, size_t len);
+int target_breakwatch_clear(target_s *target, target_breakwatch_e type, target_addr_t addr, size_t len);
 
 /* Command interpreter */
-void target_command_help(target *t);
-int target_command(target *t, int argc, const char *argv[]);
+void target_command_help(target_s *target);
+int target_command(target_s *target, int argc, const char *argv[]);
 
-/* keep target_errno in sync with errno values in gdb/include/gdb/fileio.h */
-enum target_errno {
+/* Defined per GDB's File I/O errno values from gdbsupport/fileio.h */
+typedef enum semihosting_errno {
+	TARGET_SUCCESS = 0,
 	TARGET_EPERM = 1,
 	TARGET_ENOENT = 2,
 	TARGET_EINTR = 4,
@@ -129,54 +145,16 @@ enum target_errno {
 	TARGET_ENOSYS = 88,
 	TARGET_ENAMETOOLONG = 91,
 	TARGET_EUNKNOWN = 9999,
-};
-
-enum target_open_flags {
-	TARGET_O_RDONLY = 0,
-	TARGET_O_WRONLY = 1,
-	TARGET_O_RDWR = 2,
-	TARGET_O_APPEND = 0x008,
-	TARGET_O_CREAT = 0x200,
-	TARGET_O_TRUNC = 0x400,
-};
-
-enum target_seek_flag {
-	TARGET_SEEK_SET = 0,
-	TARGET_SEEK_CUR = 1,
-	TARGET_SEEK_END = 2,
-};
+} semihosting_errno_e;
 
 struct target_controller {
-	void (*destroy_callback)(struct target_controller *, target *t);
-	void (*printf)(struct target_controller *, const char *fmt, va_list);
+	void (*destroy_callback)(target_controller_s *, target_s *target);
+	void (*printf)(target_controller_s *, const char *fmt, va_list);
 
-	/* Interface to host system calls */
-	int (*open)(struct target_controller *,
-	            target_addr path, size_t path_len,
-	            enum target_open_flags flags, mode_t mode);
-	int (*close)(struct target_controller *, int fd);
-	int (*read)(struct target_controller *,
-	            int fd, target_addr buf, unsigned int count);
-	int (*write)(struct target_controller *,
-	             int fd, target_addr buf, unsigned int count);
-	long (*lseek)(struct target_controller *,
-	              int fd, long offset, enum target_seek_flag flag);
-	int (*rename)(struct target_controller *,
-	              target_addr oldpath, size_t old_len,
-	              target_addr newpath, size_t new_len);
-	int (*unlink)(struct target_controller *,
-	              target_addr path, size_t path_len);
-	int (*stat)(struct target_controller *,
-	            target_addr path, size_t path_len, target_addr buf);
-	int (*fstat)(struct target_controller *, int fd, target_addr buf);
-	int (*gettimeofday)(struct target_controller *,
-	                    target_addr tv, target_addr tz);
-	int (*isatty)(struct target_controller *, int fd);
-	int (*system)(struct target_controller *,
-	              target_addr cmd, size_t cmd_len);
-	enum target_errno errno_;
+	void *semihosting_buffer_ptr;
+	size_t semihosting_buffer_len;
+	semihosting_errno_e gdb_errno;
 	bool interrupted;
 };
 
-#endif
-
+#endif /* INCLUDE_TARGET_H */

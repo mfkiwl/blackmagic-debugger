@@ -18,36 +18,37 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-/* Exception handling to escape deep nesting.
- * Used for the case of communicaiton failure and timeouts.
- */
-
-/* Example usage:
+/*
+ * Exception handling to escape deep nesting.
+ * Used for the case of communication failure and timeouts.
  *
- * volatile struct exception e;
- * TRY_CATCH (e, EXCEPTION_TIMEOUT) {
+ * Example usage:
+ *
+ * TRY (EXCEPTION_TIMEOUT) {
  *    ...
  *    raise_exception(EXCEPTION_TIMEOUT, "Timeout occurred");
  *    ...
  * }
- * if (e.type == EXCEPTION_TIMEOUT) {
- *    printf("timeout: %s\n", e.msg);
+ * CATCH () {
+ *    case EXCEPTION_TIMEOUT:
+ *        printf("timeout: %s\n", exception_frame.msg);
  * }
+ *
+ * Limitations:
+ * Can't use break, or goto, from inside the TRY block.
  */
 
-/* Limitations:
- * Can't use break, return, goto, etc from inside the TRY_CATCH block.
- */
-
-#ifndef __EXCEPTION_H
-#define __EXCEPTION_H
+#ifndef INCLUDE_EXCEPTION_H
+#define INCLUDE_EXCEPTION_H
 
 #include <setjmp.h>
 #include <stdint.h>
 
-#define EXCEPTION_ERROR   0x01
-#define EXCEPTION_TIMEOUT 0x02
-#define EXCEPTION_ALL     -1
+#define EXCEPTION_ERROR   0x01U
+#define EXCEPTION_TIMEOUT 0x02U
+#define EXCEPTION_ALL     UINT32_MAX
+
+typedef struct exception exception_s;
 
 struct exception {
 	uint32_t type;
@@ -55,20 +56,28 @@ struct exception {
 	/* private */
 	uint32_t mask;
 	jmp_buf jmpbuf;
-	struct exception *outer;
+	exception_s *outer;
 };
 
-extern struct exception *innermost_exception;
+extern exception_s *innermost_exception;
 
-#define TRY_CATCH(e, type_mask) \
-	(e).type = 0; \
-	(e).mask = (type_mask); \
-	(e).outer = innermost_exception; \
-	innermost_exception = (void*)&(e); \
-	if (setjmp(innermost_exception->jmpbuf) == 0) \
-		for (;innermost_exception == &(e); innermost_exception = (e).outer)
+#define TRY(type_mask)                           \
+	exception_s exception_frame;                 \
+	exception_frame.type = 0U;                   \
+	exception_frame.mask = (type_mask);          \
+	exception_frame.outer = innermost_exception; \
+	innermost_exception = &exception_frame;      \
+	if (setjmp(exception_frame.jmpbuf) == 0)
+
+#define CATCH()                                  \
+	innermost_exception = exception_frame.outer; \
+	if (exception_frame.type)                    \
+		switch (exception_frame.type)
+
+#define RETHROW              \
+	if (innermost_exception) \
+	raise_exception(exception_frame->type, exception_frame->msg)
 
 void raise_exception(uint32_t type, const char *msg);
 
-#endif
-
+#endif /* INCLUDE_EXCEPTION_H */

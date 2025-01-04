@@ -20,675 +20,632 @@
 
 #include "general.h"
 #include "target_internal.h"
+#include "gdb_packet.h"
+#include "command.h"
 
 #include <stdarg.h>
+#include <assert.h>
 
-target *target_list = NULL;
+#ifndef _MSC_VER
+#include <unistd.h>
+#endif
 
-static int target_flash_write_buffered(struct target_flash *f,
-                                       target_addr dest, const void *src, size_t len);
-static int target_flash_done_buffered(struct target_flash *f);
+#if CONFIG_BMDA == 1
+#include "platform.h"
+#endif
 
-static bool nop_function(void)
+/* Fixup for when _FILE_OFFSET_BITS == 64 as unistd.h screws this up for us */
+#if defined(lseek)
+#undef lseek
+#endif
+
+target_s *target_list = NULL;
+
+#define FLASH_WRITE_BUFFER_CEILING 1024U
+
+static bool target_cmd_mass_erase(target_s *target, int argc, const char **argv);
+static bool target_cmd_range_erase(target_s *target, int argc, const char **argv);
+static bool target_cmd_redirect_output(target_s *target, int argc, const char **argv);
+
+const command_s target_cmd_list[] = {
+	{"erase_mass", target_cmd_mass_erase, "Erase whole device Flash"},
+	{"erase_range", target_cmd_range_erase, "Erase a range of memory on a device"},
+	{"redirect_stdout", target_cmd_redirect_output, "Redirect semihosting output to aux USB serial"},
+	{NULL, NULL, NULL},
+};
+
+target_s *target_new(void)
 {
-	return true;
-}
-
-static int null_function(void)
-{
-	return 0;
-}
-
-target *target_new(void)
-{
-	target *t = (void*)calloc(1, sizeof(*t));
-	if (!t) {			/* calloc failed: heap exhaustion */
-		DEBUG_WARN("calloc: failed in %s\n", __func__);
+	target_s *target = calloc(1, sizeof(*target));
+	if (!target) { /* calloc failed: heap exhaustion */
+		DEBUG_ERROR("calloc: failed in %s\n", __func__);
 		return NULL;
 	}
 
 	if (target_list) {
-		target *c = target_list;
-		while (c->next)
-			c = c->next;
-		c->next = t;
-	} else {
-		target_list = t;
-	}
+		target_s *last_target = target_list;
+		while (last_target->next)
+			last_target = last_target->next;
+		last_target->next = target;
+	} else
+		target_list = target;
 
-	t->attach = (void*)nop_function;
-	t->detach = (void*)nop_function;
-	t->mem_read = (void*)nop_function;
-	t->mem_write = (void*)nop_function;
-	t->reg_read = (void*)nop_function;
-	t->reg_write = (void*)nop_function;
-	t->regs_read = (void*)nop_function;
-	t->regs_write = (void*)nop_function;
-	t->reset = (void*)nop_function;
-	t->halt_request = (void*)nop_function;
-	t->halt_poll = (void*)nop_function;
-	t->halt_resume = (void*)nop_function;
-	t->check_error = (void*)null_function;
+	target->target_storage = NULL;
 
-	t->target_storage = NULL;
-
-	return t;
+	target_add_commands(target, target_cmd_list, "Target");
+	return target;
 }
 
-int target_foreach(void (*cb)(int, target *t, void *context), void *context)
+size_t target_foreach(void (*callback)(size_t index, target_s *target, void *context), void *context)
 {
-	int i = 1;
-	target *t = target_list;
-	for (; t; t = t->next, i++)
-		cb(i, t, context);
-	return i;
+	size_t idx = 0;
+	for (target_s *target = target_list; target; target = target->next)
+		callback(++idx, target, context);
+	return idx;
 }
 
-void target_mem_map_free(target *t)
+void target_ram_map_free(target_s *target)
 {
-	while (t->ram) {
-		void * next = t->ram->next;
-		free(t->ram);
-		t->ram = next;
+	while (target->ram) {
+		target_ram_s *next = target->ram->next;
+		free(target->ram);
+		target->ram = next;
 	}
-	while (t->flash) {
-		void * next = t->flash->next;
-		if (t->flash->buf)
-			free(t->flash->buf);
-		free(t->flash);
-		t->flash = next;
+}
+
+void target_flash_map_free(target_s *target)
+{
+	while (target->flash) {
+		target_flash_s *next = target->flash->next;
+		if (target->flash->buf)
+			free(target->flash->buf);
+		free(target->flash);
+		target->flash = next;
 	}
+}
+
+void target_mem_map_free(target_s *target)
+{
+	target_ram_map_free(target);
+	target_flash_map_free(target);
 }
 
 void target_list_free(void)
 {
-	struct target_command_s *tc;
-
-	while(target_list) {
-		target *t = target_list->next;
-		if (target_list->tc && target_list->tc->destroy_callback)
-			target_list->tc->destroy_callback(target_list->tc, target_list);
-		if (target_list->priv)
-			target_list->priv_free(target_list->priv);
-		while (target_list->commands) {
-			tc = target_list->commands->next;
-			free(target_list->commands);
-			target_list->commands = tc;
+	target_s *volatile target = target_list;
+	while (target) {
+		target_s *next_target = target->next;
+		TRY (EXCEPTION_ALL) {
+			if (target->attached)
+				target->detach(target);
 		}
-		free(target_list->target_storage);
-		target_mem_map_free(target_list);
-		while (target_list->bw_list) {
-			void * next = target_list->bw_list->next;
-			free(target_list->bw_list);
-			target_list->bw_list = next;
+		CATCH () {
+		default:
+			DEBUG_ERROR("Exception caught while detaching from target: %s\n", exception_frame.msg);
+			target->attached = false;
+			break;
 		}
-		free(target_list);
-		target_list = t;
+		if (target->tc && target->tc->destroy_callback)
+			target->tc->destroy_callback(target->tc, target);
+		if (target->priv)
+			target->priv_free(target->priv);
+		while (target->commands) {
+			target_command_s *const tc = target->commands->next;
+			free(target->commands);
+			target->commands = tc;
+		}
+		free(target->target_storage);
+		target_mem_map_free(target);
+		while (target->bw_list) {
+			void *next = target->bw_list->next;
+			free(target->bw_list);
+			target->bw_list = next;
+		}
+		free(target);
+		target = next_target;
 	}
+	target_list = NULL;
 }
 
-void target_add_commands(target *t, const struct command_s *cmds, const char *name)
+void target_add_commands(target_s *target, const command_s *cmds, const char *name)
 {
-	struct target_command_s *tc = malloc(sizeof(*tc));
-	if (!tc) {			/* malloc failed: heap exhaustion */
-		DEBUG_WARN("malloc: failed in %s\n", __func__);
+	target_command_s *command = malloc(sizeof(*command));
+	if (!command) { /* malloc failed: heap exhaustion */
+		DEBUG_ERROR("malloc: failed in %s\n", __func__);
 		return;
 	}
 
-	if (t->commands) {
-		struct target_command_s *tail;
-		for (tail = t->commands; tail->next; tail = tail->next);
-		tail->next = tc;
-	} else {
-		t->commands = tc;
-	}
-	tc->specific_name = name;
-	tc->cmds = cmds;
-	tc->next = NULL;
+	if (target->commands) {
+		target_command_s *tail;
+		for (tail = target->commands; tail->next; tail = tail->next)
+			continue;
+		tail->next = command;
+	} else
+		target->commands = command;
+
+	command->specific_name = name;
+	command->cmds = cmds;
+	command->next = NULL;
 }
 
-target *target_attach_n(int n, struct target_controller *tc)
+target_s *target_attach_n(const size_t n, target_controller_s *controller)
 {
-	target *t;
-	int i;
-	for(t = target_list, i = 1; t; t = t->next, i++)
-		if(i == n)
-			return target_attach(t, tc);
+	target_s *target = target_list;
+	for (size_t idx = 1; target; target = target->next, ++idx) {
+		if (idx == n)
+			return target_attach(target, controller);
+	}
 	return NULL;
 }
 
-target *target_attach(target *t, struct target_controller *tc)
+target_s *target_attach(target_s *target, target_controller_s *controller)
 {
-	if (t->tc)
-		t->tc->destroy_callback(t->tc, t);
+	if (target->tc)
+		target->tc->destroy_callback(target->tc, target);
 
-	t->tc = tc;
+	target->tc = controller;
+	platform_target_clk_output_enable(true);
+	DEBUG_TARGET("Attaching to target..\n");
 
-	if (!t->attach(t))
+	if (target->attach && !target->attach(target)) {
+		DEBUG_TARGET("Attach failed\n");
+		platform_target_clk_output_enable(false);
 		return NULL;
+	}
 
-	t->attached = true;
-	return t;
+	DEBUG_TARGET("Attach success\n");
+	target->attached = true;
+	return target;
 }
 
-void target_add_ram(target *t, target_addr start, uint32_t len)
+void target_add_ram32(target_s *const target, const target_addr32_t start, const uint32_t len)
 {
-	struct target_ram *ram = malloc(sizeof(*ram));
-	if (!ram) {			/* malloc failed: heap exhaustion */
-		DEBUG_WARN("malloc: failed in %s\n", __func__);
+	target_add_ram64(target, start, len);
+}
+
+void target_add_ram64(target_s *const target, const target_addr64_t start, const uint64_t len)
+{
+	target_ram_s *ram = malloc(sizeof(*ram));
+	if (!ram) { /* malloc failed: heap exhaustion */
+		DEBUG_ERROR("malloc: failed in %s\n", __func__);
 		return;
 	}
 
 	ram->start = start;
 	ram->length = len;
-	ram->next = t->ram;
-	t->ram = ram;
+	ram->next = target->ram;
+	target->ram = ram;
 }
 
-void target_add_flash(target *t, struct target_flash *f)
+void target_add_flash(target_s *target, target_flash_s *flash)
 {
-	if (f->buf_size == 0)
-		f->buf_size = MIN(f->blocksize, 0x400);
-	f->t = t;
-	f->next = t->flash;
-	t->flash = f;
+	if (flash->writesize == 0)
+		flash->writesize = flash->blocksize;
+
+	/* Automatically sized buffer */
+	/* For targets with larger than FLASH_WRITE_BUFFER_CEILING write size, we use a buffer of write size */
+	/* No point doing math if we can't fit at least 2 writesizes in a buffer */
+	if (flash->writesize <= FLASH_WRITE_BUFFER_CEILING / 2U) {
+		const size_t count = FLASH_WRITE_BUFFER_CEILING / flash->writesize;
+		flash->writebufsize = flash->writesize * count;
+	} else
+		flash->writebufsize = flash->writesize;
+
+	flash->t = target;
+	flash->next = target->flash;
+	target->flash = flash;
 }
 
-static ssize_t map_ram(char *buf, size_t len, struct target_ram *ram)
+bool target_enter_flash_mode_stub(target_s *target)
 {
-	return snprintf(buf, len, "<memory type=\"ram\" start=\"0x%08"PRIx32
-	                          "\" length=\"0x%"PRIx32"\"/>",
-	                          ram->start, (uint32_t)ram->length);
-}
-
-static ssize_t map_flash(char *buf, size_t len, struct target_flash *f)
-{
-	int i = 0;
-	i += snprintf(&buf[i], len - i, "<memory type=\"flash\" start=\"0x%08"PRIx32
-	                                "\" length=\"0x%"PRIx32"\">",
-	                                f->start, (uint32_t)f->length);
-	i += snprintf(&buf[i], len - i, "<property name=\"blocksize\">0x%"PRIx32
-	                            "</property></memory>",
-	                            (uint32_t)f->blocksize);
-	return i;
-}
-
-bool target_mem_map(target *t, char *tmp, size_t len)
-{
-	size_t i = 0;
-	i = snprintf(&tmp[i], len - i, "<memory-map>");
-	/* Map each defined RAM */
-	for (struct target_ram *r = t->ram; r; r = r->next)
-		i += map_ram(&tmp[i], len - i, r);
-	/* Map each defined Flash */
-	for (struct target_flash *f = t->flash; f; f = f->next)
-		i += map_flash(&tmp[i], len - i, f);
-	i += snprintf(&tmp[i], len - i, "</memory-map>");
-
-	if (i > (len -2))
-		return false;
+	(void)target;
 	return true;
 }
 
-static struct target_flash *flash_for_addr(target *t, uint32_t addr)
+static ssize_t map_ram(char *buf, size_t len, target_ram_s *ram)
 {
-	for (struct target_flash *f = t->flash; f; f = f->next)
-		if ((f->start <= addr) &&
-		    (addr < (f->start + f->length)))
-			return f;
-	return NULL;
+	return snprintf(buf, len, "<memory type=\"ram\" start=\"0x%08" PRIx32 "\" length=\"0x%" PRIx32 "\"/>", ram->start,
+		(uint32_t)ram->length);
 }
 
-int target_flash_erase(target *t, target_addr addr, size_t len)
+static ssize_t map_flash(char *buf, size_t len, target_flash_s *flash)
 {
-	int ret = 0;
-	while (len) {
-		struct target_flash *f = flash_for_addr(t, addr);
-		if (!f) {
-			DEBUG_WARN("Erase stopped at 0x%06" PRIx32 "\n", addr);
-			return ret;
-		}
-		size_t tmptarget = MIN(addr + len, f->start + f->length);
-		size_t tmplen = tmptarget - addr;
-		ret |= f->erase(f, addr, tmplen);
-		addr += tmplen;
-		len -= tmplen;
-	}
-	return ret;
+	ssize_t offset = 0;
+	offset += snprintf(&buf[offset], len - offset,
+		"<memory type=\"flash\" start=\"0x%08" PRIx32 "\" length=\"0x%" PRIx32 "\">", flash->start,
+		(uint32_t)flash->length);
+	offset += snprintf(buf + offset, len - offset, "<property name=\"blocksize\">0x%" PRIx32 "</property></memory>",
+		(uint32_t)flash->blocksize);
+	return offset;
 }
 
-int target_flash_write(target *t,
-                       target_addr dest, const void *src, size_t len)
+bool target_mem_map(target_s *target, char *tmp, size_t len)
 {
-	int ret = 0;
-	while (len) {
-		struct target_flash *f = flash_for_addr(t, dest);
-		if (!f)
-			return 1;
-		size_t tmptarget = MIN(dest + len, f->start + f->length);
-		size_t tmplen = tmptarget - dest;
-		ret |= target_flash_write_buffered(f, dest, src, tmplen);
-		dest += tmplen;
-		src += tmplen;
-		len -= tmplen;
-	}
-	return ret;
+	size_t offset = 0;
+	offset = snprintf(tmp + offset, len - offset, "<memory-map>");
+	/* Map each defined RAM */
+	for (target_ram_s *ram = target->ram; ram; ram = ram->next)
+		offset += map_ram(tmp + offset, len - offset, ram);
+	/* Map each defined Flash */
+	for (target_flash_s *flash = target->flash; flash; flash = flash->next)
+		offset += map_flash(tmp + offset, len - offset, flash);
+	offset += snprintf(tmp + offset, len - offset, "</memory-map>");
+	return offset < len - 1U;
 }
 
-int target_flash_done(target *t)
+void target_print_progress(platform_timeout_s *const timeout)
 {
-	for (struct target_flash *f = t->flash; f; f = f->next) {
-		int tmp = target_flash_done_buffered(f);
-		if (tmp)
-			return tmp;
-		if (f->done) {
-			tmp = f->done(f);
-			if (tmp)
-				return tmp;
-		}
+	if (platform_timeout_is_expired(timeout)) {
+		gdb_out(".");
+		platform_timeout_set(timeout, 500);
 	}
-	return 0;
-}
-
-int target_flash_write_buffered(struct target_flash *f,
-                                target_addr dest, const void *src, size_t len)
-{
-	int ret = 0;
-
-	if (f->buf == NULL) {
-		/* Allocate flash sector buffer */
-		f->buf = malloc(f->buf_size);
-		if (!f->buf) {			/* malloc failed: heap exhaustion */
-			DEBUG_WARN("malloc: failed in %s\n", __func__);
-			return 1;
-		}
-		f->buf_addr = -1;
-	}
-	while (len) {
-		uint32_t offset = dest % f->buf_size;
-		uint32_t base = dest - offset;
-		if (base != f->buf_addr) {
-			if (f->buf_addr != (uint32_t)-1) {
-				/* Write sector to flash if valid */
-				ret |= f->write(f, f->buf_addr,
-				                f->buf, f->buf_size);
-			}
-			/* Setup buffer for a new sector */
-			f->buf_addr = base;
-			memset(f->buf, f->erased, f->buf_size);
-		}
-		/* Copy chunk into sector buffer */
-		size_t sectlen = MIN(f->buf_size - offset, len);
-		memcpy(f->buf + offset, src, sectlen);
-		dest += sectlen;
-		src += sectlen;
-		len -= sectlen;
-	}
-	return ret;
-}
-
-int target_flash_done_buffered(struct target_flash *f)
-{
-	int ret = 0;
-	if ((f->buf != NULL) &&(f->buf_addr != (uint32_t)-1)) {
-		/* Write sector to flash if valid */
-		ret = f->write(f, f->buf_addr, f->buf, f->buf_size);
-		f->buf_addr = -1;
-		free(f->buf);
-		f->buf = NULL;
-	}
-
-	return ret;
 }
 
 /* Wrapper functions */
-void target_detach(target *t)
+void target_detach(target_s *target)
 {
-	t->detach(t);
-	t->attached = false;
-#if PC_HOSTED == 1
+	DEBUG_TARGET("Detaching from target\n");
+	if (target->detach)
+		target->detach(target);
+	platform_target_clk_output_enable(false);
+	target->attached = false;
+#if CONFIG_BMDA == 1
 	platform_buffer_flush();
 #endif
 }
 
-bool target_check_error(target *t) {
-	if (t)
-		return t->check_error(t);
-	else
-		return false;
+bool target_check_error(target_s *target)
+{
+	if (target && target->check_error)
+		return target->check_error(target);
+	return false;
 }
-
-bool target_attached(target *t) { return t->attached; }
 
 /* Memory access functions */
-int target_mem_read(target *t, void *dest, target_addr src, size_t len)
+bool target_mem32_read(target_s *const target, void *const dest, const target_addr_t src, const size_t len)
 {
-	t->mem_read(t, dest, src, len);
-	return target_check_error(t);
+	return target_mem64_read(target, dest, src, len);
 }
 
-int target_mem_write(target *t, target_addr dest, const void *src, size_t len)
+bool target_mem64_read(target_s *const target, void *const dest, const target_addr64_t src, const size_t len)
 {
-	t->mem_write(t, dest, src, len);
-	return target_check_error(t);
+	/* If we're processing a semihosting syscall and it needs IO redirected, handle that instead */
+	if (target->target_options & TOPT_IN_SEMIHOSTING_SYSCALL) {
+		/* Make sure we can't go over the bounds of the buffer */
+		const size_t amount = MIN(len, target->tc->semihosting_buffer_len);
+		/* Copy data into the request destination buffer from the semihosting buffer */
+		memcpy(dest, target->tc->semihosting_buffer_ptr, amount);
+		return false;
+	}
+	/* Otherwise if the target defines a memory read function, call that instead and check for errors */
+	if (target->mem_read)
+		target->mem_read(target, dest, src, len);
+	return target_check_error(target);
+}
+
+bool target_mem32_write(target_s *const target, const target_addr_t dest, const void *const src, const size_t len)
+{
+	return target_mem64_write(target, dest, src, len);
+}
+
+bool target_mem64_write(target_s *const target, const target_addr64_t dest, const void *const src, const size_t len)
+{
+	/* If we're processing a semihosting syscall and it needs IO redirected, handle that instead */
+	if (target->target_options & TOPT_IN_SEMIHOSTING_SYSCALL) {
+		/* Make sure we can't go over the bounds of the buffer */
+		const size_t amount = MIN(len, target->tc->semihosting_buffer_len);
+		/* Copy data into the semihosting buffer from the request source buffer */
+		memcpy(target->tc->semihosting_buffer_ptr, src, amount);
+		return false;
+	}
+	/* Otherwise if the target defines a memory write function, call that instead and check for errors */
+	if (target->mem_write)
+		target->mem_write(target, dest, src, len);
+	return target_check_error(target);
+}
+
+/* Returns true if the target needs halting to access memory on it */
+bool target_mem_access_needs_halt(target_s *target)
+{
+	return !(target->target_options & TOPT_NON_HALTING_MEM_IO);
 }
 
 /* Register access functions */
-ssize_t target_reg_read(target *t, int reg, void *data, size_t max)
+size_t target_reg_read(target_s *target, uint32_t reg, void *data, size_t max)
 {
-	return t->reg_read(t, reg, data, max);
+	if (target->reg_read)
+		return target->reg_read(target, reg, data, max);
+	return 0;
 }
 
-ssize_t target_reg_write(target *t, int reg, const void *data, size_t size)
+size_t target_reg_write(target_s *target, uint32_t reg, const void *data, size_t size)
 {
-	return t->reg_write(t, reg, data, size);
+	if (target->reg_write)
+		return target->reg_write(target, reg, data, size);
+	return 0;
 }
 
-void target_regs_read(target *t, void *data)
+void target_regs_read(target_s *target, void *data)
 {
-	if (t->regs_read) {
-		t->regs_read(t, data);
-		return;
-	}
-	for (size_t x = 0, i = 0; x < t->regs_size; ) {
-		x += t->reg_read(t, i++, data + x, t->regs_size - x);
+	if (target->regs_read)
+		target->regs_read(target, data);
+	else {
+		for (size_t offset = 0, i = 0; offset < target->regs_size;)
+			offset += target_reg_read(target, i++, (uint8_t *)data + offset, target->regs_size - offset);
 	}
 }
-void target_regs_write(target *t, const void *data)
+
+void target_regs_write(target_s *target, const void *data)
 {
-	if (t->regs_write) {
-		t->regs_write(t, data);
-		return;
-	}
-	for (size_t x = 0, i = 0; x < t->regs_size; ) {
-		x += t->reg_write(t, i++, data + x, t->regs_size - x);
+	if (target->regs_write)
+		target->regs_write(target, data);
+	else {
+		for (size_t offset = 0, i = 0; offset < target->regs_size;)
+			offset += target_reg_write(target, i++, (const uint8_t *)data + offset, target->regs_size - offset);
 	}
 }
 
 /* Halt/resume functions */
-void target_reset(target *t) { t->reset(t); }
-void target_halt_request(target *t) { t->halt_request(t); }
-enum target_halt_reason target_halt_poll(target *t, target_addr *watch)
+void target_reset(target_s *target)
 {
-	return t->halt_poll(t, watch);
+	DEBUG_TARGET("Resetting target\n");
+	if (target->reset)
+		target->reset(target);
 }
 
-void target_halt_resume(target *t, bool step) { t->halt_resume(t, step); }
+void target_halt_request(target_s *target)
+{
+	DEBUG_TARGET("Halting target\n");
+	if (target->halt_request)
+		target->halt_request(target);
+}
 
-/* Command line for semihosting get_cmdline */
-void target_set_cmdline(target *t, char *cmdline) {
-	uint32_t len_dst;
-	len_dst = sizeof(t->cmdline)-1;
-	strncpy(t->cmdline, cmdline, len_dst -1);
-	t->cmdline[strlen(t->cmdline)]='\0';
-	DEBUG_INFO("cmdline: >%s<\n", t->cmdline);
+#ifndef DEBUG_TARGET_IS_NOOP
+static const char *target_halt_reason_str(const target_halt_reason_e reason)
+{
+	switch (reason) {
+	case TARGET_HALT_RUNNING:
+		return "Target is still running";
+	case TARGET_HALT_ERROR:
+		return "An error occured";
+	case TARGET_HALT_REQUEST:
+		return "Halt requested";
+	case TARGET_HALT_STEPPING:
+		return "Step complete";
+	case TARGET_HALT_BREAKPOINT:
+		return "Breakpoint hit";
+	case TARGET_HALT_WATCHPOINT:
+		return "Watchpoint hit";
+	case TARGET_HALT_FAULT:
+		return "A fault occured on the target";
+	default:
+		return "Unknown halt reason";
 	}
+}
+#endif
+
+target_halt_reason_e target_halt_poll(target_s *target, target_addr_t *watch)
+{
+	if (target->halt_poll) {
+		const target_halt_reason_e reason = target->halt_poll(target, watch);
+#ifndef DEBUG_TARGET_IS_NOOP
+		if (reason != TARGET_HALT_RUNNING)
+			DEBUG_TARGET("Target halted: %s\n", target_halt_reason_str(reason));
+#endif
+		return reason;
+	}
+	/* XXX: Is this actually the desired fallback behaviour? */
+	return TARGET_HALT_RUNNING;
+}
+
+void target_halt_resume(target_s *target, bool step)
+{
+	DEBUG_TARGET("%s target\n", step ? "Single stepping" : "Resuming");
+	if (target->halt_resume)
+		target->halt_resume(target, step);
+}
+
+/* Command line for semihosting SYS_GET_CMDLINE */
+void target_set_cmdline(target_s *target, const char *const cmdline, const size_t cmdline_len)
+{
+	/* This assertion is really expensive, so only include it on BMDA builds */
+#if CONFIG_BMDA == 1
+	/* Check and make sure that we don't exceed the target buffer size */
+	assert(cmdline_len < MAX_CMDLINE);
+#endif
+	memcpy(target->cmdline, cmdline, cmdline_len + 1U);
+	DEBUG_INFO("cmdline: >%s<\n", target->cmdline);
+}
 
 /* Set heapinfo for semihosting */
-void target_set_heapinfo(target *t, target_addr heap_base, target_addr heap_limit,
-	target_addr stack_base, target_addr stack_limit) {
-	if (t == NULL) return;
-	t->heapinfo[0] = heap_base;
-	t->heapinfo[1] = heap_limit;
-	t->heapinfo[2] = stack_base;
-	t->heapinfo[3] = stack_limit;
+void target_set_heapinfo(target_s *target, target_addr_t heap_base, target_addr_t heap_limit, target_addr_t stack_base,
+	target_addr_t stack_limit)
+{
+	if (target == NULL)
+		return;
+	target->heapinfo[0] = heap_base;
+	target->heapinfo[1] = heap_limit;
+	target->heapinfo[2] = stack_base;
+	target->heapinfo[3] = stack_limit;
 }
 
 /* Break-/watchpoint functions */
-int target_breakwatch_set(target *t,
-                          enum target_breakwatch type, target_addr addr, size_t len)
+int target_breakwatch_set(target_s *target, target_breakwatch_e type, target_addr_t addr, size_t len)
 {
-	struct breakwatch bw = {
+	breakwatch_s bw = {
 		.type = type,
 		.addr = addr,
 		.size = len,
 	};
 	int ret = 1;
 
-	if (t->breakwatch_set)
-		ret = t->breakwatch_set(t, &bw);
+	if (target->breakwatch_set)
+		ret = target->breakwatch_set(target, &bw);
 
 	if (ret == 0) {
 		/* Success, make a heap copy */
-		struct breakwatch *bwm = malloc(sizeof bw);
-		if (!bwm) {			/* malloc failed: heap exhaustion */
-			DEBUG_WARN("malloc: failed in %s\n", __func__);
+		breakwatch_s *bwm = malloc(sizeof(bw));
+		if (!bwm) { /* malloc failed: heap exhaustion */
+			DEBUG_ERROR("malloc: failed in %s\n", __func__);
 			return 1;
 		}
 		memcpy(bwm, &bw, sizeof(bw));
 
 		/* Add to list */
-		bwm->next = t->bw_list;
-		t->bw_list = bwm;
+		bwm->next = target->bw_list;
+		target->bw_list = bwm;
 	}
 
 	return ret;
 }
 
-int target_breakwatch_clear(target *t,
-                            enum target_breakwatch type, target_addr addr, size_t len)
+int target_breakwatch_clear(target_s *target, target_breakwatch_e type, target_addr_t addr, size_t len)
 {
-	struct breakwatch *bwp = NULL, *bw;
-	int ret = 1;
-	for (bw = t->bw_list; bw; bwp = bw, bw = bw->next)
-		if ((bw->type == type) &&
-		    (bw->addr == addr) &&
-		    (bw->size == len))
+	breakwatch_s *bwp = NULL, *bw;
+	for (bw = target->bw_list; bw; bwp = bw, bw = bw->next) {
+		if (bw->type == type && bw->addr == addr && bw->size == len)
 			break;
+	}
 
 	if (bw == NULL)
 		return -1;
 
-	if (t->breakwatch_clear)
-		ret = t->breakwatch_clear(t, bw);
+	int ret = 1;
+	if (target->breakwatch_clear)
+		ret = target->breakwatch_clear(target, bw);
 
 	if (ret == 0) {
-		if (bwp == NULL) {
-			t->bw_list = bw->next;
-		} else {
+		if (bwp == NULL)
+			target->bw_list = bw->next;
+		else
 			bwp->next = bw->next;
-		}
 		free(bw);
 	}
 	return ret;
 }
 
+/* Target-specific commands */
+static bool target_cmd_mass_erase(target_s *const target, const int argc, const char **const argv)
+{
+	(void)argc;
+	(void)argv;
+	if (!target) {
+		gdb_out("Mass erase not available\n");
+		return true;
+	}
+	gdb_out("Erasing device Flash: ");
+	const bool result = target_flash_mass_erase(target);
+	gdb_out("done\n");
+	return result;
+}
+
+static bool target_cmd_range_erase(target_s *const target, const int argc, const char **const argv)
+{
+	if (argc < 3) {
+		gdb_out("usage: monitor erase_range <address> <count>\n");
+		gdb_out("\t<address> is an address in the first page to erase\n");
+		gdb_out("\t<count> is the number bytes after that to erase, rounded to the next higher whole page\n");
+		return true;
+	}
+	const uint32_t addr = strtoul(argv[1], NULL, 0);
+	const uint32_t length = strtoul(argv[2], NULL, 0);
+
+	return target_flash_erase(target, addr, length);
+}
+
+static bool target_cmd_redirect_output(target_s *target, int argc, const char **argv)
+{
+	if (argc == 1) {
+		gdb_outf("Semihosting stdout redirection: %s\n", target->stdout_redirected ? "enabled" : "disabled");
+		return true;
+	}
+	return parse_enable_or_disable(argv[1], &target->stdout_redirected);
+}
+
 /* Accessor functions */
-size_t target_regs_size(target *t)
+size_t target_regs_size(target_s *target)
 {
-	return t->regs_size;
+	return target->regs_size;
 }
 
-const char *target_tdesc(target *t)
+/*
+ * Get an XML description of the target's registers. Called during the attach phase when
+ * GDB supplies request `qXfer:features:read:target.xml:`. The pointer returned by this call
+ * must be passed to `free()` on conclusion of its use.
+ */
+const char *target_regs_description(target_s *target)
 {
-	return t->tdesc ? t->tdesc : "";
+	if (target->regs_description)
+		return target->regs_description(target);
+	return NULL;
 }
 
-const char *target_driver_name(target *t)
+uint32_t target_mem32_read32(target_s *target, target_addr32_t addr)
 {
-	return t->driver;
+	uint32_t result = 0;
+	target_mem32_read(target, &result, addr, sizeof(result));
+	return result;
 }
 
-const char *target_core_name(target *t)
+bool target_mem32_write32(target_s *target, target_addr32_t addr, uint32_t value)
 {
-	return t->core;
+	return target_mem32_write(target, addr, &value, sizeof(value));
 }
 
-unsigned int target_designer(target *t)
+uint16_t target_mem32_read16(target_s *target, target_addr32_t addr)
 {
-	return t->t_designer;
+	uint16_t result = 0;
+	target_mem32_read(target, &result, addr, sizeof(result));
+	return result;
 }
 
-unsigned int target_idcode(target *t)
+bool target_mem32_write16(target_s *target, target_addr32_t addr, uint16_t value)
 {
-	return t->idcode;
+	return target_mem32_write(target, addr, &value, sizeof(value));
 }
 
-uint32_t target_mem_read32(target *t, uint32_t addr)
+uint8_t target_mem32_read8(target_s *target, target_addr32_t addr)
 {
-	uint32_t ret;
-	t->mem_read(t, &ret, addr, sizeof(ret));
-	return ret;
+	uint8_t result = 0;
+	target_mem32_read(target, &result, addr, sizeof(result));
+	return result;
 }
 
-void target_mem_write32(target *t, uint32_t addr, uint32_t value)
+bool target_mem32_write8(target_s *target, target_addr32_t addr, uint8_t value)
 {
-	t->mem_write(t, addr, &value, sizeof(value));
+	return target_mem32_write(target, addr, &value, sizeof(value));
 }
 
-uint16_t target_mem_read16(target *t, uint32_t addr)
+void target_command_help(target_s *target)
 {
-	uint16_t ret;
-	t->mem_read(t, &ret, addr, sizeof(ret));
-	return ret;
-}
-
-void target_mem_write16(target *t, uint32_t addr, uint16_t value)
-{
-	t->mem_write(t, addr, &value, sizeof(value));
-}
-
-uint8_t target_mem_read8(target *t, uint32_t addr)
-{
-	uint8_t ret;
-	t->mem_read(t, &ret, addr, sizeof(ret));
-	return ret;
-}
-
-void target_mem_write8(target *t, uint32_t addr, uint8_t value)
-{
-	t->mem_write(t, addr, &value, sizeof(value));
-}
-
-void target_command_help(target *t)
-{
-	for (struct target_command_s *tc = t->commands; tc; tc = tc->next) {
-		tc_printf(t, "%s specific commands:\n", tc->specific_name);
-		for(const struct command_s *c = tc->cmds; c->cmd; c++)
-			tc_printf(t, "\t%s -- %s\n", c->cmd, c->help);
+	for (const target_command_s *target_commands = target->commands; target_commands;
+		 target_commands = target_commands->next) {
+		tc_printf(target, "%s specific commands:\n", target_commands->specific_name);
+		for (const command_s *command = target_commands->cmds; command->cmd; command++)
+			tc_printf(target, "\t%s -- %s\n", command->cmd, command->help);
 	}
 }
 
-int target_command(target *t, int argc, const char *argv[])
+int target_command(target_s *target, int argc, const char *argv[])
 {
-	for (struct target_command_s *tc = t->commands; tc; tc = tc->next)
-		for(const struct command_s *c = tc->cmds; c->cmd; c++)
-			if(!strncmp(argv[0], c->cmd, strlen(argv[0])))
-				return (c->handler(t, argc, argv)) ? 0 : 1;
+	for (const target_command_s *target_commands = target->commands; target_commands;
+		 target_commands = target_commands->next) {
+		for (const command_s *command = target_commands->cmds; command->cmd; command++) {
+			if (!strncmp(argv[0], command->cmd, strlen(argv[0])))
+				return command->handler(target, argc, argv) ? 0 : 1;
+		}
+	}
 	return -1;
 }
 
-void tc_printf(target *t, const char *fmt, ...)
+void tc_printf(target_s *target, const char *fmt, ...)
 {
-	(void)t;
-	va_list ap;
-
-	if (t->tc == NULL)
+	if (target->tc == NULL)
 		return;
 
+	va_list ap;
 	va_start(ap, fmt);
-	t->tc->printf(t->tc, fmt, ap);
+	target->tc->printf(target->tc, fmt, ap);
 	fflush(stdout);
 	va_end(ap);
-}
-
-/* Interface to host system calls */
-int tc_open(target *t, target_addr path, size_t plen,
-            enum target_open_flags flags, mode_t mode)
-{
-	if (t->tc->open == NULL) {
-		t->tc->errno_ = TARGET_ENFILE;
-		return -1;
-	}
-	return t->tc->open(t->tc, path, plen, flags, mode);
-}
-
-int tc_close(target *t, int fd)
-{
-	if (t->tc->close == NULL) {
-		t->tc->errno_ = TARGET_EBADF;
-		return -1;
-	}
-	return t->tc->close(t->tc, fd);
-}
-
-int tc_read(target *t, int fd, target_addr buf, unsigned int count)
-{
-	if (t->tc->read == NULL)
-		return 0;
-	return t->tc->read(t->tc, fd, buf, count);
-}
-
-int tc_write(target *t, int fd, target_addr buf, unsigned int count)
-{
-	if (t->tc->write == NULL)
-		return 0;
-	return t->tc->write(t->tc, fd, buf, count);
-}
-
-long tc_lseek(target *t, int fd, long offset, enum target_seek_flag flag)
-{
-	if (t->tc->lseek == NULL)
-		return 0;
-	return t->tc->lseek(t->tc, fd, offset, flag);
-}
-
-int tc_rename(target *t, target_addr oldpath, size_t oldlen,
-                         target_addr newpath, size_t newlen)
-{
-	if (t->tc->rename == NULL) {
-		t->tc->errno_ = TARGET_ENOENT;
-		return -1;
-	}
-	return t->tc->rename(t->tc, oldpath, oldlen, newpath, newlen);
-}
-
-int tc_unlink(target *t, target_addr path, size_t plen)
-{
-	if (t->tc->unlink == NULL) {
-		t->tc->errno_ = TARGET_ENOENT;
-		return -1;
-	}
-	return t->tc->unlink(t->tc, path, plen);
-}
-
-int tc_stat(target *t, target_addr path, size_t plen, target_addr buf)
-{
-	if (t->tc->stat == NULL) {
-		t->tc->errno_ = TARGET_ENOENT;
-		return -1;
-	}
-	return t->tc->stat(t->tc, path, plen, buf);
-}
-
-int tc_fstat(target *t, int fd, target_addr buf)
-{
-	if (t->tc->fstat == NULL) {
-		return 0;
-	}
-	return t->tc->fstat(t->tc, fd, buf);
-}
-
-int tc_gettimeofday(target *t, target_addr tv, target_addr tz)
-{
-	if (t->tc->gettimeofday == NULL) {
-		return -1;
-	}
-	return t->tc->gettimeofday(t->tc, tv, tz);
-}
-
-int tc_isatty(target *t, int fd)
-{
-	if (t->tc->isatty == NULL) {
-		return 1;
-	}
-	return t->tc->isatty(t->tc, fd);
-}
-
-int tc_system(target *t, target_addr cmd, size_t cmdlen)
-{
-	if (t->tc->system == NULL) {
-		return -1;
-	}
-	return t->tc->system(t->tc, cmd, cmdlen);
 }

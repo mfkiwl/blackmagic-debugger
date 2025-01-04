@@ -26,7 +26,7 @@
 #include "usbdfu.h"
 #include "platform.h"
 
-uint32_t app_address = 0x08002000;
+uintptr_t app_address = 0x08002000;
 int dfu_activity_counter = 0;
 
 void dfu_detach(void)
@@ -39,7 +39,7 @@ int main(void)
 {
 	/* Check the force bootloader pin*/
 	rcc_periph_clock_enable(RCC_GPIOB);
-	if(gpio_get(GPIOB, GPIO12))
+	if (gpio_get(GPIOB, GPIO12))
 		dfu_jump_app_if_valid();
 
 	dfu_protect(false);
@@ -57,15 +57,13 @@ int main(void)
 	systick_counter_enable();
 
 	/* Configure the LED pins. */
-	gpio_set_mode(LED_PORT, GPIO_MODE_OUTPUT_2_MHZ,
-			GPIO_CNF_OUTPUT_PUSHPULL, LED_0 | LED_1 | LED_2);
+	gpio_set_mode(LED_PORT, GPIO_MODE_OUTPUT_2_MHZ, GPIO_CNF_OUTPUT_PUSHPULL, LED_0 | LED_1 | LED_2);
 
 	dfu_init(&st_usbfs_v1_usb_driver);
 
 	/* Configure the USB pull up pin. */
 	gpio_set(GPIOA, GPIO8);
-	gpio_set_mode(GPIOA, GPIO_MODE_OUTPUT_2_MHZ,
-			GPIO_CNF_OUTPUT_PUSHPULL, GPIO8);
+	gpio_set_mode(GPIOA, GPIO_MODE_OUTPUT_2_MHZ, GPIO_CNF_OUTPUT_PUSHPULL, GPIO8);
 
 	dfu_main();
 }
@@ -111,9 +109,8 @@ void sys_tick_handler(void)
 			break;
 		case 2:
 			gpio_toggle(LED_PORT, LED_0); /* LED0 on/off */
-			count=0;
+			count = 0;
 			break;
 		}
 	}
 }
-

@@ -1,29 +1,17 @@
-ifneq ($(V), 1)
-MFLAGS += --no-print-dir
-Q := @
-endif
-
-PC_HOSTED =
-NO_LIBOPENCM3 =
-ifeq ($(PROBE_HOST), hosted)
-	PC_HOSTED = true
-	NO_LIBOPENCM3 = true
-endif
-
 all:
-ifndef NO_LIBOPENCM3
-	$(Q)if [ ! -f libopencm3/Makefile ]; then \
-		echo "Initialising git submodules..." ;\
-		git submodule init ;\
-		git submodule update ;\
-	fi
-	$(Q)$(MAKE) $(MFLAGS) -C libopencm3 lib
-endif
-	$(Q)$(MAKE) $(MFLAGS) -C src
-
-clean:
-ifndef NO_LIBOPENCM3
-	$(Q)$(MAKE) $(MFLAGS) -C libopencm3 $@
-endif
-	$(Q)$(MAKE) $(MFLAGS) -C src $@
-
+	@echo "Makefile build system is depricated."
+	@echo ""
+	@echo "Please use Meson build system instead."
+	@echo ""
+	@echo "For most basic build, which builds only Black Magic Debug Application (BMDA), run the following commands:"
+	@echo "> meson setup build"
+	@echo "> meson compile -C build"
+	@echo ""
+	@echo "You can find example firmware configuration files in the \`cross-file\` subdirectory."
+	@echo "For example, to build a firmware for the native hardware run the following commands:"
+	@echo "> meson setup build-native --cross-file cross-file/native.ini --werror"
+	@echo "> meson compile -C build-native"
+	@echo ""
+	@echo "For further instructions please refer to the README.md in the root directory of this repository."
+	@echo ""
+	@exit 1

@@ -18,10 +18,17 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef __GDB_MAIN_H
-#define __GDB_MAIN_H
+#ifndef INCLUDE_GDB_MAIN_H
+#define INCLUDE_GDB_MAIN_H
 
-void gdb_main(void);
+#include "target.h"
+#include "gdb_packet.h"
 
-#endif
+extern bool gdb_target_running;
+extern target_s *cur_target;
 
+void gdb_poll_target(void);
+void gdb_main(const gdb_packet_s *packet);
+int32_t gdb_main_loop(target_controller_s *tc, const gdb_packet_s *packet, bool in_syscall);
+
+#endif /* INCLUDE_GDB_MAIN_H */
